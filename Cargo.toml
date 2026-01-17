@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nook-core",
+    "crates/nook",
+    "crates/nookd",
+]
