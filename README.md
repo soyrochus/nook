@@ -1,7 +1,42 @@
 # Nook
 
-Amorphous, end-to-end encrypted push/pull file vault. The server stores only opaque blobs; all
-filesystem meaning and encryption live on the client.
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![FOSS Pluralism](https://img.shields.io/badge/FOSS-Pluralism-green.svg)](FOSS_PLURALISM_MANIFESTO.md)
+
+**Zero-knowledge encrypted file vault for untrusted infrastructure.**
+
+Push and pull files through hostile networks, traffic-intercepting proxies, and compromised servers—without revealing a single filename.
+
+![Nook](./images/nook-logo-small.png)
+
+## Overview
+
+Nook is a minimal private file vault designed to operate correctly in **fully untrusted environments**, including TLS-intercepting firewalls, corporate MITM proxies, hostile networks, and server compromise scenarios.
+
+### Core principle
+
+**No file contents, filenames, directory structure, paths, or filesystem semantics may ever appear outside authenticated encryption.**
+
+The server is a **semantic null**—it understands only random object IDs and ciphertext. All meaning exists exclusively on the client.
+
+### Key features
+
+- **Mandatory end-to-end encryption (E2EE)**: Every file, directory name, and path is encrypted before leaving the client
+- **Amorphous traffic**: All payloads are indistinguishable encrypted blobs; the server cannot differentiate between files, manifests, or metadata
+- **TLS-MITM resistant**: Confidentiality does not rely on TLS; even complete TLS interception reveals nothing
+- **Atomic updates**: Safe concurrent writers using compare-and-swap (CAS) semantics
+- **Simple deployment**: One Rust server binary (`nookd`), one Rust CLI binary (`nook`)
+- **Zero-knowledge server**: Server compromise yields only ciphertext
+
+### What Nook is NOT
+
+- Not a sync daemon (no background sync)
+- Not a version control system (no merge, diff, or conflict resolution)
+- Not traffic-analysis resistant (volume and timing remain observable)
+- Not a backup system with versioning
+
+Nook is for pushing and pulling complete encrypted snapshots of directory trees between devices you control, through infrastructure you don't trust.
 
 ## Requirements
 
