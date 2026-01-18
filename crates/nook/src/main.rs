@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::fs as tokio_fs;
 use walkdir::WalkDir;
 
@@ -37,6 +37,12 @@ enum Commands {
     Root {
         #[arg(long)]
         set: Option<PathBuf>,
+    },
+    Ls {
+        subpath: Option<PathBuf>,
+    },
+    Tree {
+        subpath: Option<PathBuf>,
     },
     Push {
         subpath: Option<PathBuf>,
@@ -88,6 +94,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { server, root } => cmd_init(server, root).await?,
         Commands::Root { set } => cmd_root(set).await?,
+        Commands::Ls { subpath } => cmd_ls(cli.server, subpath).await?,
+        Commands::Tree { subpath } => cmd_tree(cli.server, subpath).await?,
         Commands::Push { subpath } => cmd_push(cli.server, subpath).await?,
         Commands::Pull { subpath } => cmd_pull(cli.server, subpath).await?,
         Commands::Status => cmd_status(cli.server).await?,
@@ -147,111 +155,179 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         .clone()
         .context("set root via `nook root --set <path>` before pushing")?;
     let server = server_override.unwrap_or(cfg.server.clone());
-    let base_path = match subpath {
+    let base_path = match &subpath {
         Some(p) => root.join(p),
         None => root.clone(),
     };
     let client = http_client()?;
     let vault_key = VaultKey(cfg.vault_key);
-    let mut next_node_id = 1u64;
-    let root_node_id = next_node_id;
-    let mut nodes = Vec::new();
-    nodes.push(Node {
-        node_id: root_node_id,
-        parent_id: None,
-        name: base_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string(),
-        node_type: NodeType::Directory,
-        content_object_id: None,
-        wrapped_dek: None,
-        logical_size: None,
-    });
 
+    // Try to fetch existing manifest, or create empty one
+    let head_id = derive_head_object_id(&vault_key);
+    let head_hex = hex::encode(head_id);
+    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &vault_key).await {
+        Ok((m, e)) => (m, e),
+        Err(_) => {
+            // No existing manifest, create a new one with root directory
+            let new_manifest = Manifest {
+                manifest_version: 1,
+                root_node_id: 1,
+                nodes: vec![Node {
+                    node_id: 1,
+                    parent_id: None,
+                    name: root
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("vault")
+                        .to_string(),
+                    node_type: NodeType::Directory,
+                    content_object_id: None,
+                    wrapped_dek: None,
+                    logical_size: None,
+                }],
+                previous_manifest_hash: None,
+                integrity_checksum: String::new(),
+            };
+            (new_manifest, None)
+        }
+    };
+
+    // Build indexes for existing manifest
+    let mut next_node_id = manifest.nodes.iter().map(|n| n.node_id).max().unwrap_or(0) + 1;
+
+    // Build a path-to-node mapping for the existing manifest
+    // The manifest root corresponds to the configured root directory
     let mut path_to_node: HashMap<PathBuf, u64> = HashMap::new();
-    path_to_node.insert(base_path.clone(), root_node_id);
+    let mut node_to_path: HashMap<u64, PathBuf> = HashMap::new();
+    build_path_mappings(&manifest, &root, &mut path_to_node, &mut node_to_path);
 
     let mut uploads: Vec<([u8; 32], Vec<u8>)> = Vec::new();
 
-    let mut entries: Vec<_> = WalkDir::new(&base_path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path() != base_path)
-        .collect();
-    entries.sort_by_key(|e| e.path().to_owned());
+    // Check if base_path is a file or directory
+    let base_metadata = tokio_fs::metadata(&base_path).await.context(format!(
+        "cannot access {}",
+        base_path.display()
+    ))?;
 
-    for entry in entries {
-        let path = entry.path().to_path_buf();
-        let parent_path = path
-            .parent()
-            .expect("walkdir never yields root without parent")
-            .to_path_buf();
-        let parent_id = *path_to_node
-            .get(&parent_path)
-            .expect("parent must already exist");
-        let node_id = {
-            next_node_id += 1;
-            next_node_id
-        };
-        let name = entry
+    if base_metadata.is_file() {
+        // Pushing a single file
+        let file_name = base_path
             .file_name()
-            .to_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".into());
-        if entry.file_type().is_dir() {
-            nodes.push(Node {
-                node_id,
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let parent_path = base_path.parent().unwrap_or(&root).to_path_buf();
+
+        // Ensure parent directory exists in manifest
+        let parent_id = ensure_path_exists(&mut manifest, &mut next_node_id, &root, &parent_path, &mut path_to_node)?;
+
+        // Check if file already exists
+        let existing_idx = manifest.nodes.iter().position(|n| {
+            n.parent_id == Some(parent_id) && n.name == file_name
+        });
+
+        // Create encrypted content
+        let mut object_id = [0u8; 32];
+        OsRng.fill_bytes(&mut object_id);
+        let data = tokio_fs::read(&base_path).await?;
+        let encrypted =
+            encrypt_object(object_id, ObjectType::Content, &data, &vault_key).context(format!(
+                "encrypting {}",
+                base_path.display()
+            ))?;
+        let serialized = serialize_encrypted_object(&encrypted)?;
+        uploads.push((object_id, serialized));
+
+        if let Some(idx) = existing_idx {
+            // Update existing node
+            manifest.nodes[idx].content_object_id = Some(object_id);
+            manifest.nodes[idx].wrapped_dek = Some(encrypted.wrapped_key.0.clone());
+            manifest.nodes[idx].logical_size = Some(data.len() as u64);
+        } else {
+            // Create new file node
+            let file_node_id = next_node_id;
+            next_node_id += 1;
+            manifest.nodes.push(Node {
+                node_id: file_node_id,
                 parent_id: Some(parent_id),
-                name,
-                node_type: NodeType::Directory,
-                content_object_id: None,
-                wrapped_dek: None,
-                logical_size: None,
-            });
-            path_to_node.insert(path.clone(), node_id);
-        } else if entry.file_type().is_file() {
-            let mut object_id = [0u8; 32];
-            OsRng.fill_bytes(&mut object_id);
-            let data = tokio_fs::read(&path).await?;
-            let encrypted =
-                encrypt_object(object_id, ObjectType::Content, &data, &vault_key).context(format!(
-                    "encrypting {}",
-                    path.display()
-                ))?;
-            let serialized = serialize_encrypted_object(&encrypted)?;
-            uploads.push((object_id, serialized));
-            nodes.push(Node {
-                node_id,
-                parent_id: Some(parent_id),
-                name,
+                name: file_name,
                 node_type: NodeType::File,
                 content_object_id: Some(object_id),
                 wrapped_dek: Some(encrypted.wrapped_key.0.clone()),
                 logical_size: Some(data.len() as u64),
             });
         }
+    } else {
+        // Pushing a directory
+        let mut entries: Vec<_> = WalkDir::new(&base_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.path().to_owned());
+
+        for entry in entries {
+            let path = entry.path().to_path_buf();
+            let name = entry
+                .file_name()
+                .to_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".into());
+
+            if entry.file_type().is_dir() {
+                // Ensure directory exists in manifest
+                ensure_path_exists(&mut manifest, &mut next_node_id, &root, &path, &mut path_to_node)?;
+            } else if entry.file_type().is_file() {
+                let parent_path = path.parent().unwrap_or(&root).to_path_buf();
+                let parent_id = ensure_path_exists(&mut manifest, &mut next_node_id, &root, &parent_path, &mut path_to_node)?;
+
+                // Check if file already exists
+                let existing_idx = manifest.nodes.iter().position(|n| {
+                    n.parent_id == Some(parent_id) && n.name == name
+                });
+
+                // Create encrypted content
+                let mut object_id = [0u8; 32];
+                OsRng.fill_bytes(&mut object_id);
+                let data = tokio_fs::read(&path).await?;
+                let encrypted =
+                    encrypt_object(object_id, ObjectType::Content, &data, &vault_key).context(format!(
+                        "encrypting {}",
+                        path.display()
+                    ))?;
+                let serialized = serialize_encrypted_object(&encrypted)?;
+                uploads.push((object_id, serialized));
+
+                if let Some(idx) = existing_idx {
+                    // Update existing node
+                    manifest.nodes[idx].content_object_id = Some(object_id);
+                    manifest.nodes[idx].wrapped_dek = Some(encrypted.wrapped_key.0.clone());
+                    manifest.nodes[idx].logical_size = Some(data.len() as u64);
+                } else {
+                    // Create new file node
+                    let file_node_id = next_node_id;
+                    next_node_id += 1;
+                    manifest.nodes.push(Node {
+                        node_id: file_node_id,
+                        parent_id: Some(parent_id),
+                        name,
+                        node_type: NodeType::File,
+                        content_object_id: Some(object_id),
+                        wrapped_dek: Some(encrypted.wrapped_key.0.clone()),
+                        logical_size: Some(data.len() as u64),
+                    });
+                }
+            }
+        }
     }
 
-    let mut manifest = Manifest {
-        manifest_version: 1,
-        root_node_id,
-        nodes,
-        previous_manifest_hash: None,
-        integrity_checksum: String::new(),
-    };
     manifest.integrity_checksum = manifest.compute_integrity()?;
     let manifest_bytes = serde_json::to_vec(&manifest)?;
 
-    let head_id = derive_head_object_id(&vault_key);
     let manifest_object =
         encrypt_object(head_id, ObjectType::Manifest, &manifest_bytes, &vault_key)?;
     let manifest_serialized = serialize_encrypted_object(&manifest_object)?;
 
-    let head_hex = hex::encode(head_id);
-    let etag = head_object(&client, &server, &head_hex).await?;
     for (object_id, bytes) in uploads {
         let hex_id = hex::encode(object_id);
         put_object(&client, &server, &hex_id, bytes, None).await?;
@@ -262,7 +338,247 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
     Ok(())
 }
 
-async fn cmd_pull(server_override: Option<String>, _subpath: Option<PathBuf>) -> Result<()> {
+/// Builds mappings from filesystem paths to manifest node IDs and vice versa
+fn build_path_mappings(
+    manifest: &Manifest,
+    root: &Path,
+    path_to_node: &mut HashMap<PathBuf, u64>,
+    node_to_path: &mut HashMap<u64, PathBuf>,
+) {
+    // Map root node to the configured root path
+    path_to_node.insert(root.to_path_buf(), manifest.root_node_id);
+    node_to_path.insert(manifest.root_node_id, root.to_path_buf());
+
+    // Build parent->children index
+    let mut children_by_parent: HashMap<u64, Vec<&Node>> = HashMap::new();
+    for node in &manifest.nodes {
+        if let Some(parent_id) = node.parent_id {
+            children_by_parent.entry(parent_id).or_default().push(node);
+        }
+    }
+
+    // BFS to build all paths
+    let mut queue = vec![manifest.root_node_id];
+    while let Some(node_id) = queue.pop() {
+        let parent_path = node_to_path.get(&node_id).cloned().unwrap();
+        if let Some(children) = children_by_parent.get(&node_id) {
+            for child in children {
+                let child_path = parent_path.join(&child.name);
+                path_to_node.insert(child_path.clone(), child.node_id);
+                node_to_path.insert(child.node_id, child_path);
+                if matches!(child.node_type, NodeType::Directory) {
+                    queue.push(child.node_id);
+                }
+            }
+        }
+    }
+}
+
+/// Ensures a path exists in the manifest, creating directories as needed.
+/// Returns the node ID for the path.
+fn ensure_path_exists(
+    manifest: &mut Manifest,
+    next_node_id: &mut u64,
+    root: &Path,
+    target_path: &Path,
+    path_to_node: &mut HashMap<PathBuf, u64>,
+) -> Result<u64> {
+    // If path already exists, return its node ID
+    if let Some(&node_id) = path_to_node.get(target_path) {
+        return Ok(node_id);
+    }
+
+    // Build the path from root to target, creating directories as needed
+    let rel_path = target_path.strip_prefix(root).unwrap_or(target_path);
+    let mut current_path = root.to_path_buf();
+    let mut current_id = manifest.root_node_id;
+
+    for component in rel_path.components() {
+        if let Component::Normal(name_os) = component {
+            let name = name_os.to_str().context("path must be valid UTF-8")?;
+            current_path = current_path.join(name);
+
+            if let Some(&existing_id) = path_to_node.get(&current_path) {
+                current_id = existing_id;
+            } else {
+                // Create new directory node
+                let new_id = *next_node_id;
+                *next_node_id += 1;
+                manifest.nodes.push(Node {
+                    node_id: new_id,
+                    parent_id: Some(current_id),
+                    name: name.to_string(),
+                    node_type: NodeType::Directory,
+                    content_object_id: None,
+                    wrapped_dek: None,
+                    logical_size: None,
+                });
+                path_to_node.insert(current_path.clone(), new_id);
+                current_id = new_id;
+            }
+        }
+    }
+
+    Ok(current_id)
+}
+
+async fn fetch_manifest_with_etag(
+    client: &Client,
+    server: &str,
+    vault_key: &VaultKey,
+) -> Result<(Manifest, Option<String>)> {
+    let head_id = derive_head_object_id(vault_key);
+    let head_hex = hex::encode(head_id);
+
+    let url = format!("{server}/v1/obj/{head_hex}");
+    let res = client.get(&url).send().await?;
+
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!("manifest not found"));
+    }
+    if !res.status().is_success() {
+        return Err(anyhow::anyhow!("GET failed with status {}", res.status()));
+    }
+
+    let etag = res
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    let manifest_bytes = res.bytes().await?.to_vec();
+    let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes)?;
+    let decrypted = decrypt_object(head_id, &wrapped, &chunks, vault_key)?;
+    let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext)?;
+    manifest.validate_integrity()?;
+
+    Ok((manifest, etag))
+}
+
+async fn cmd_ls(server_override: Option<String>, subpath: Option<PathBuf>) -> Result<()> {
+    let cfg = load_config().context("nook not initialized; run `nook init`")?;
+    let server = server_override.unwrap_or(cfg.server.clone());
+    let client = http_client()?;
+    let vault_key = VaultKey(cfg.vault_key);
+    let manifest = fetch_manifest(&client, &server, &vault_key).await?;
+
+    let (nodes_by_id, children_by_id) = index_manifest(&manifest);
+    let target_id = match subpath {
+        Some(path) => resolve_subpath(&manifest, &nodes_by_id, &children_by_id, &path)?,
+        None => manifest.root_node_id,
+    };
+    let target_idx = nodes_by_id
+        .get(&target_id)
+        .context("manifest missing target node")?;
+    let target = &manifest.nodes[*target_idx];
+
+    match target.node_type {
+        NodeType::File => {
+            print_entry(target);
+        }
+        NodeType::Directory => {
+            let mut children = children_by_id
+                .get(&target_id)
+                .cloned()
+                .unwrap_or_default();
+            children.sort_by_key(|id| {
+                nodes_by_id
+                    .get(id)
+                    .and_then(|idx| manifest.nodes.get(*idx))
+                    .map(|n| n.name.clone())
+                    .unwrap_or_default()
+            });
+            for child_id in children {
+                if let Some(idx) = nodes_by_id.get(&child_id) {
+                    print_entry(&manifest.nodes[*idx]);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_tree(server_override: Option<String>, subpath: Option<PathBuf>) -> Result<()> {
+    let cfg = load_config().context("nook not initialized; run `nook init`")?;
+    let server = server_override.unwrap_or(cfg.server.clone());
+    let client = http_client()?;
+    let vault_key = VaultKey(cfg.vault_key);
+    let manifest = fetch_manifest(&client, &server, &vault_key).await?;
+
+    let (nodes_by_id, children_by_id) = index_manifest(&manifest);
+    let target_id = match subpath {
+        Some(path) => resolve_subpath(&manifest, &nodes_by_id, &children_by_id, &path)?,
+        None => manifest.root_node_id,
+    };
+    let target_idx = nodes_by_id
+        .get(&target_id)
+        .context("manifest missing target node")?;
+    let target = &manifest.nodes[*target_idx];
+
+    // Print the root of the tree
+    match target.node_type {
+        NodeType::File => {
+            println!("{}", target.name);
+        }
+        NodeType::Directory => {
+            println!("{}/", target.name);
+            print_tree_recursive(&manifest, &nodes_by_id, &children_by_id, target_id, "");
+        }
+    }
+
+    Ok(())
+}
+
+fn print_tree_recursive(
+    manifest: &Manifest,
+    nodes_by_id: &HashMap<u64, usize>,
+    children_by_id: &HashMap<u64, Vec<u64>>,
+    node_id: u64,
+    prefix: &str,
+) {
+    let mut children: Vec<u64> = children_by_id
+        .get(&node_id)
+        .cloned()
+        .unwrap_or_default();
+
+    // Sort children by name
+    children.sort_by_key(|id| {
+        nodes_by_id
+            .get(id)
+            .and_then(|idx| manifest.nodes.get(*idx))
+            .map(|n| n.name.clone())
+            .unwrap_or_default()
+    });
+
+    let count = children.len();
+    for (i, child_id) in children.iter().enumerate() {
+        let is_last = i == count - 1;
+        let connector = if is_last { "└── " } else { "├── " };
+        let child_prefix = if is_last { "    " } else { "│   " };
+
+        if let Some(&idx) = nodes_by_id.get(child_id) {
+            let child = &manifest.nodes[idx];
+            match child.node_type {
+                NodeType::Directory => {
+                    println!("{}{}{}/", prefix, connector, child.name);
+                    print_tree_recursive(
+                        manifest,
+                        nodes_by_id,
+                        children_by_id,
+                        *child_id,
+                        &format!("{}{}", prefix, child_prefix),
+                    );
+                }
+                NodeType::File => {
+                    println!("{}{}{}", prefix, connector, child.name);
+                }
+            }
+        }
+    }
+}
+
+async fn cmd_pull(server_override: Option<String>, subpath: Option<PathBuf>) -> Result<()> {
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let root = cfg
         .root
@@ -271,65 +587,140 @@ async fn cmd_pull(server_override: Option<String>, _subpath: Option<PathBuf>) ->
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
     let vault_key = VaultKey(cfg.vault_key);
-    let head_id = derive_head_object_id(&vault_key);
-    let head_hex = hex::encode(head_id);
-    let manifest_bytes = get_object(&client, &server, &head_hex)
-        .await
-        .context("manifest not found; push first")?;
-    let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes)?;
-    let decrypted = decrypt_object(head_id, &wrapped, &chunks, &vault_key)?;
-    let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext)?;
-    manifest.validate_integrity()?;
+    let manifest = fetch_manifest(&client, &server, &vault_key).await?;
 
-    let mut node_paths: HashMap<u64, PathBuf> = HashMap::new();
-    node_paths.insert(manifest.root_node_id, root.clone());
-    tokio_fs::create_dir_all(&root).await?;
+    let (nodes_by_id, children_by_id) = index_manifest(&manifest);
 
-    let mut sorted_nodes = manifest.nodes.clone();
-    sorted_nodes.sort_by_key(|n| n.node_id);
+    // Build complete path mapping for all nodes, rooted at the local root
+    let mut node_to_path: HashMap<u64, PathBuf> = HashMap::new();
+    node_to_path.insert(manifest.root_node_id, root.clone());
 
-    for node in sorted_nodes {
-        if node.node_id == manifest.root_node_id {
-            continue;
-        }
-        let parent = node
-            .parent_id
-            .and_then(|id| node_paths.get(&id).cloned())
-            .context("manifest missing parent linkage")?;
-        let path = parent.join(&node.name);
-        match node.node_type {
-            NodeType::Directory => {
-                tokio_fs::create_dir_all(&path).await?;
-                node_paths.insert(node.node_id, path);
-            }
-            NodeType::File => {
-                let object_id = node
-                    .content_object_id
-                    .context("file entry missing object id")?;
-                let wrapped_dek = node.wrapped_dek.clone().context("missing wrapped dek")?;
-                let wrapped = WrappedKey(wrapped_dek);
-                let cipher_bytes = get_object(&client, &server, &hex::encode(object_id)).await?;
-                let (wrapped_from_object, chunks) =
-                    nook_core::deserialize_encrypted_object(&cipher_bytes)?;
-                // Prefer manifest's wrapped key but fall back if object envelope differs.
-                let wrapped_to_use = if !wrapped_from_object.0.is_empty() {
-                    wrapped_from_object
-                } else {
-                    wrapped
-                };
-                let decrypted = decrypt_object(object_id, &wrapped_to_use, &chunks, &vault_key)?;
-                if let Some(expected) = node.logical_size {
-                    if expected != decrypted.plaintext.len() as u64 {
-                        return Err(anyhow::anyhow!("size mismatch for {}", path.display()));
+    // BFS to build all paths
+    let mut queue = vec![manifest.root_node_id];
+    while let Some(node_id) = queue.pop() {
+        let parent_path = node_to_path.get(&node_id).cloned().unwrap();
+        if let Some(children) = children_by_id.get(&node_id) {
+            for &child_id in children {
+                if let Some(&idx) = nodes_by_id.get(&child_id) {
+                    let child = &manifest.nodes[idx];
+                    let child_path = parent_path.join(&child.name);
+                    node_to_path.insert(child_id, child_path);
+                    if matches!(child.node_type, NodeType::Directory) {
+                        queue.push(child_id);
                     }
                 }
-                write_atomic(&path, &decrypted.plaintext)?;
+            }
+        }
+    }
+
+    // Determine the target node based on subpath
+    let target_id = match &subpath {
+        Some(path) => resolve_subpath(&manifest, &nodes_by_id, &children_by_id, path)?,
+        None => manifest.root_node_id,
+    };
+
+    // Collect all nodes that need to be pulled (the target and all descendants)
+    let nodes_to_pull = collect_subtree(&manifest, &nodes_by_id, &children_by_id, target_id);
+
+    // Process nodes in BFS order to ensure parents are created before children
+    let mut pull_queue = vec![target_id];
+    let mut processed = std::collections::HashSet::new();
+
+    while let Some(node_id) = pull_queue.pop() {
+        if processed.contains(&node_id) {
+            continue;
+        }
+        processed.insert(node_id);
+
+        let idx = nodes_by_id
+            .get(&node_id)
+            .context("manifest missing node")?;
+        let node = &manifest.nodes[*idx];
+        let path = node_to_path
+            .get(&node_id)
+            .context("missing path mapping for node")?;
+
+        match node.node_type {
+            NodeType::Directory => {
+                tokio_fs::create_dir_all(path).await?;
+                // Add children to queue
+                if let Some(children) = children_by_id.get(&node_id) {
+                    for &child_id in children {
+                        if nodes_to_pull.contains(&child_id) {
+                            pull_queue.push(child_id);
+                        }
+                    }
+                }
+            }
+            NodeType::File => {
+                // Ensure parent directory exists
+                if let Some(parent) = path.parent() {
+                    tokio_fs::create_dir_all(parent).await?;
+                }
+                pull_file(&client, &server, &vault_key, node, path).await?;
             }
         }
     }
 
     println!("Pull complete.");
     Ok(())
+}
+
+async fn pull_file(
+    client: &Client,
+    server: &str,
+    vault_key: &VaultKey,
+    node: &Node,
+    path: &Path,
+) -> Result<()> {
+    let object_id = node
+        .content_object_id
+        .context("file entry missing object id")?;
+    let wrapped_dek = node.wrapped_dek.clone().context("missing wrapped dek")?;
+    let wrapped = WrappedKey(wrapped_dek);
+    let cipher_bytes = get_object(client, server, &hex::encode(object_id)).await?;
+    let (wrapped_from_object, chunks) = nook_core::deserialize_encrypted_object(&cipher_bytes)?;
+    // Prefer manifest's wrapped key but fall back if object envelope differs.
+    let wrapped_to_use = if !wrapped_from_object.0.is_empty() {
+        wrapped_from_object
+    } else {
+        wrapped
+    };
+    let decrypted = decrypt_object(object_id, &wrapped_to_use, &chunks, vault_key)?;
+    if let Some(expected) = node.logical_size {
+        if expected != decrypted.plaintext.len() as u64 {
+            return Err(anyhow::anyhow!("size mismatch for {}", path.display()));
+        }
+    }
+    write_atomic(path, &decrypted.plaintext)?;
+    Ok(())
+}
+
+fn collect_subtree(
+    manifest: &Manifest,
+    nodes_by_id: &HashMap<u64, usize>,
+    children_by_id: &HashMap<u64, Vec<u64>>,
+    root_id: u64,
+) -> std::collections::HashSet<u64> {
+    let mut result = std::collections::HashSet::new();
+    result.insert(root_id);
+    let mut stack = vec![root_id];
+
+    while let Some(current) = stack.pop() {
+        if let Some(children) = children_by_id.get(&current) {
+            for &child_id in children {
+                result.insert(child_id);
+                // Check if this child is a directory to recurse
+                if let Some(&idx) = nodes_by_id.get(&child_id) {
+                    if matches!(manifest.nodes[idx].node_type, NodeType::Directory) {
+                        stack.push(child_id);
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
@@ -404,6 +795,93 @@ async fn get_object(client: &Client, server: &str, object_id_hex: &str) -> Resul
         "GET failed with status {}",
         res.status()
     ))
+}
+
+async fn fetch_manifest(client: &Client, server: &str, vault_key: &VaultKey) -> Result<Manifest> {
+    let head_id = derive_head_object_id(vault_key);
+    let head_hex = hex::encode(head_id);
+    let manifest_bytes = get_object(client, server, &head_hex)
+        .await
+        .context("manifest not found; push first")?;
+    let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes)?;
+    let decrypted = decrypt_object(head_id, &wrapped, &chunks, vault_key)?;
+    let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext)?;
+    manifest.validate_integrity()?;
+    Ok(manifest)
+}
+
+fn index_manifest(manifest: &Manifest) -> (HashMap<u64, usize>, HashMap<u64, Vec<u64>>) {
+    let mut nodes_by_id = HashMap::new();
+    for (idx, node) in manifest.nodes.iter().enumerate() {
+        nodes_by_id.insert(node.node_id, idx);
+    }
+    let mut children_by_id: HashMap<u64, Vec<u64>> = HashMap::new();
+    for node in &manifest.nodes {
+        if let Some(parent) = node.parent_id {
+            children_by_id.entry(parent).or_default().push(node.node_id);
+        }
+    }
+    (nodes_by_id, children_by_id)
+}
+
+fn resolve_subpath(
+    manifest: &Manifest,
+    nodes_by_id: &HashMap<u64, usize>,
+    children_by_id: &HashMap<u64, Vec<u64>>,
+    subpath: &Path,
+) -> Result<u64> {
+    let mut current = manifest.root_node_id;
+    let mut components = subpath.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(anyhow::anyhow!("subpath must not contain '..'"));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow::anyhow!("subpath must be relative to the vault root"));
+            }
+            Component::Normal(os) => {
+                let name = os
+                    .to_str()
+                    .context("subpath must be valid UTF-8")?;
+                let mut found = None;
+                if let Some(children) = children_by_id.get(&current) {
+                    for child_id in children {
+                        let idx = nodes_by_id
+                            .get(child_id)
+                            .context("manifest missing child node")?;
+                        let child = &manifest.nodes[*idx];
+                        if child.name == name {
+                            found = Some(child.node_id);
+                            break;
+                        }
+                    }
+                }
+                let child_id =
+                    found.ok_or_else(|| anyhow::anyhow!("subpath not found: {}", subpath.display()))?;
+                let idx = nodes_by_id
+                    .get(&child_id)
+                    .context("manifest missing child node")?;
+                let child = &manifest.nodes[*idx];
+                if components.peek().is_some() && matches!(child.node_type, NodeType::File) {
+                    return Err(anyhow::anyhow!(
+                        "subpath traverses into file: {}",
+                        subpath.display()
+                    ));
+                }
+                current = child.node_id;
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn print_entry(node: &Node) {
+    match node.node_type {
+        NodeType::Directory => println!("{}/", node.name),
+        NodeType::File => println!("{}", node.name),
+    }
 }
 
 fn load_config() -> Result<Config> {

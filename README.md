@@ -96,20 +96,23 @@ Set or view the local root later:
 
 ## Push / pull
 
-Push uploads an encrypted snapshot of the root (or a subpath) and atomically updates the head:
+Push uploads files to the vault. Pushing merges with existing content—files are added or updated, but other files are preserved:
 
 ```bash
-./target/release/nook push
-./target/release/nook push subdir/inside/root
+./target/release/nook push              # Push entire root directory
+./target/release/nook push README.md     # Push a single file
+./target/release/nook push docs/         # Push a subdirectory
 ```
 
-Pull downloads the latest snapshot and materializes it into the local root:
+Pull downloads and materializes files from the vault into your local root:
 
 ```bash
-./target/release/nook pull
+./target/release/nook pull               # Pull entire vault
+./target/release/nook pull docs/spec.md  # Pull a specific file
+./target/release/nook pull images/       # Pull a subdirectory
 ```
 
-Note: `pull` currently ignores the optional subpath argument.
+Both commands preserve directory structure and support selective sync.
 
 ## Status / overrides
 
@@ -125,6 +128,24 @@ Override the server URL per command:
 ./target/release/nook --server http://other-host:8080 status
 ./target/release/nook --server http://other-host:8080 push
 ```
+
+## Browse vault contents
+
+List the top-level entries stored in the encrypted manifest:
+
+```bash
+./target/release/nook ls
+./target/release/nook ls path/inside/vault   # List a subdirectory
+```
+
+View a recursive tree of the vault structure:
+
+```bash
+./target/release/nook tree
+./target/release/nook tree docs/             # Tree from a subdirectory
+```
+
+All discovery happens locally by decrypting the manifest—no server queries reveal structure.
 
 ## Usage notes
 
