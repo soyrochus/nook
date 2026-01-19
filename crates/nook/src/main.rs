@@ -246,7 +246,6 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         } else {
             // Create new file node
             let file_node_id = next_node_id;
-            next_node_id += 1;
             manifest.nodes.push(Node {
                 node_id: file_node_id,
                 parent_id: Some(parent_id),

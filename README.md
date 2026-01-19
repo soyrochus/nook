@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![FOSS Pluralism](https://img.shields.io/badge/FOSS-Pluralism-green.svg)](FOSS_PLURALISM_MANIFESTO.md)
 
-**Zero-knowledge encrypted file vault for untrusted infrastructure.**
+**Your private Dropbox—encrypted end-to-end, even from the server.**
 
 Push and pull files through hostile networks, traffic-intercepting proxies, and compromised servers—without revealing a single filename.
 
