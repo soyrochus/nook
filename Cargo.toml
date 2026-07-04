@@ -5,3 +5,7 @@ members = [
     "crates/nook",
     "crates/nookd",
 ]
+
+[workspace.package]
+version = "0.9.0"
+edition = "2021"

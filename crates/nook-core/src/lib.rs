@@ -1,7 +1,9 @@
+mod auth;
 mod crypto;
 mod manifest;
 mod object;
 
+pub use auth::*;
 pub use crypto::*;
 pub use manifest::*;
 pub use object::*;

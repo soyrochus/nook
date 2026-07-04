@@ -2,7 +2,8 @@ mod support;
 
 use std::collections::HashMap;
 use std::fs;
-use support::{run_nook, Nookd};
+use support::{create_vault, run_nook, Nookd};
+use walkdir::WalkDir;
 
 fn setup(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let storage_dir = tmp.join("storage");
@@ -13,20 +14,38 @@ fn setup(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, std:
     (storage_dir, config_home, vault_root)
 }
 
+/// Object files now live nested under `objects/<vault_id>/<namespace_id>/`
+/// (SPEC-004 §7) rather than flat under `objects/`, so tests must walk
+/// recursively to find the actual stored files.
+fn stored_object_files(objects_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    WalkDir::new(objects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+fn init_and_set_root(config_home: &std::path::Path, server_url: &str, vault_id: &str, vault_credential: &str, vault_root: &std::path::Path) {
+    let init = run_nook(
+        config_home,
+        &["init", "--server", server_url, "--vault-id", vault_id, "--vault-credential", vault_credential],
+    );
+    assert!(init.status.success(), "init failed: {init:?}");
+    let root = run_nook(config_home, &["root", "--set", vault_root.to_str().unwrap()]);
+    assert!(root.status.success(), "root --set failed: {root:?}");
+}
+
 #[test]
 fn first_push_to_fresh_vault_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let (storage_dir, config_home, vault_root) = setup(tmp.path());
     fs::write(vault_root.join("hello.txt"), b"hello world").unwrap();
 
+    let (vault_id, vault_credential) = create_vault(&storage_dir);
     let server = Nookd::start(&storage_dir);
     let server_url = server.url();
-
-    let init = run_nook(&config_home, &["init", "--server", &server_url]);
-    assert!(init.status.success(), "init failed: {init:?}");
-
-    let root = run_nook(&config_home, &["root", "--set", vault_root.to_str().unwrap()]);
-    assert!(root.status.success(), "root --set failed: {root:?}");
+    init_and_set_root(&config_home, &server_url, &vault_id, &vault_credential, &vault_root);
 
     let push = run_nook(&config_home, &["push"]);
     assert!(
@@ -36,7 +55,7 @@ fn first_push_to_fresh_vault_succeeds() {
 
     // One object for the manifest (head) plus one for hello.txt's content.
     let objects_dir = storage_dir.join("objects");
-    let count = fs::read_dir(&objects_dir).unwrap().count();
+    let count = stored_object_files(&objects_dir).len();
     assert_eq!(count, 2, "expected the manifest object and one content object");
 }
 
@@ -46,19 +65,15 @@ fn corrupted_manifest_aborts_push_and_leaves_server_untouched() {
     let (storage_dir, config_home, vault_root) = setup(tmp.path());
     fs::write(vault_root.join("hello.txt"), b"hello world").unwrap();
 
+    let (vault_id, vault_credential) = create_vault(&storage_dir);
     let server = Nookd::start(&storage_dir);
     let server_url = server.url();
+    init_and_set_root(&config_home, &server_url, &vault_id, &vault_credential, &vault_root);
 
-    assert!(run_nook(&config_home, &["init", "--server", &server_url]).status.success());
-    assert!(
-        run_nook(&config_home, &["root", "--set", vault_root.to_str().unwrap()])
-            .status
-            .success()
-    );
     assert!(run_nook(&config_home, &["push"]).status.success(), "initial push must succeed");
 
     let objects_dir = storage_dir.join("objects");
-    let entries: Vec<_> = fs::read_dir(&objects_dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let entries = stored_object_files(&objects_dir);
     assert_eq!(entries.len(), 2, "manifest + one content object after first push");
 
     // Corrupt every stored object (flip a byte in the middle) so the
@@ -93,7 +108,7 @@ fn corrupted_manifest_aborts_push_and_leaves_server_untouched() {
         );
     }
 
-    let entries_after: Vec<_> = fs::read_dir(&objects_dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let entries_after = stored_object_files(&objects_dir);
     assert_eq!(
         entries_after.len(),
         2,

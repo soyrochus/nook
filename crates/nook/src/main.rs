@@ -17,19 +17,29 @@ use std::path::{Component, Path, PathBuf};
 use tokio::fs as tokio_fs;
 use walkdir::WalkDir;
 
-/// Fixed keychain coordinates for the vault key. Only one vault config
-/// exists per machine (single fixed config path), so a constant service and
-/// account name is sufficient to locate the secret.
+/// Fixed keychain coordinates for the local secrets blob. Only one vault
+/// config exists per machine (single fixed config path), so a constant
+/// service and account name is sufficient to locate the secret.
 const KEYCHAIN_SERVICE: &str = "dev.nook.vault";
 const KEYCHAIN_ACCOUNT: &str = "vault_key";
 
-/// Associated data binding the passphrase-wrapped vault key to its purpose,
-/// so it can never be confused with any other ciphertext produced by nook.
+/// Associated data binding the passphrase-wrapped secrets blob to its
+/// purpose, so it can never be confused with any other ciphertext produced
+/// by nook.
 const LOCAL_KEY_AAD: &[u8] = b"nook-local-vault-key-v1";
 
 /// Environment variable allowing non-interactive passphrase supply for
 /// scripted or CI use of the encrypted-local-file fallback.
 const PASSPHRASE_ENV_VAR: &str = "NOOK_PASSPHRASE";
+
+/// Bundle format tag for exported/imported namespace identities (SPEC-004 §6).
+const NAMESPACE_BUNDLE_PREFIX: &str = "nookns1";
+
+/// A namespace key (SPEC-001's VaultKey/VMK, renamed) is 32 bytes; a vault
+/// credential is also 32 bytes. Both are protected together as one 64-byte
+/// blob under the same keychain entry / passphrase-encrypted file, so a user
+/// only ever has one passphrase to manage.
+const SECRETS_LEN: usize = 64;
 
 #[derive(Parser)]
 #[command(author, version, about = "Nook CLI — encrypted push/pull vault")]
@@ -47,6 +57,17 @@ enum Commands {
         server: String,
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Vault ID issued by the server operator (`nookd vault create`).
+        #[arg(long)]
+        vault_id: String,
+        /// Vault credential issued alongside the vault ID. Never stored in
+        /// recoverable form — only used once here to protect it locally.
+        #[arg(long)]
+        vault_credential: String,
+        /// Adopt an existing namespace (from `nook namespace export`)
+        /// instead of generating a new one.
+        #[arg(long)]
+        import_namespace: Option<String>,
     },
     Root {
         #[arg(long)]
@@ -65,21 +86,46 @@ enum Commands {
         subpath: Option<PathBuf>,
     },
     Status,
+    /// Manage this client's namespace identity (SPEC-004 §6).
+    Namespace {
+        #[command(subcommand)]
+        action: NamespaceCommand,
+    },
 }
 
-/// Client configuration, persisted as TOML. `vault_key` is always an opaque
-/// reference (a keychain marker or an encrypted blob) — never the raw
-/// Vault Master Key — so the config file alone never discloses key material.
+#[derive(Subcommand)]
+enum NamespaceCommand {
+    /// Print a portable bundle encoding this client's namespace identity,
+    /// for sharing with a collaborator over a secure out-of-band channel.
+    Export,
+}
+
+/// Client configuration, persisted as TOML. `vault_id`/`namespace_id` are
+/// non-secret, opaque routing labels (SPEC-004 §2). `secrets` is always an
+/// opaque reference (a keychain marker or an encrypted blob) — never the raw
+/// namespace key or vault credential — so the config file alone never
+/// discloses key material.
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
     server: String,
     root: Option<PathBuf>,
-    vault_key: KeyStorage,
+    vault_id: String,
+    namespace_id: String,
+    secrets: KeyStorage,
 }
 
-/// How the Vault Master Key is stored: preferentially in the OS keychain, or
-/// (when no keychain is available) as an Argon2id-passphrase-wrapped blob
-/// encrypted with XChaCha20-Poly1305.
+/// Bundles the vault-level access identity needed to reach the server,
+/// separate from `VaultKey` (the namespace's cryptographic identity).
+struct ClientAuth {
+    vault_id: String,
+    namespace_id: String,
+    vault_credential: [u8; 32],
+}
+
+/// How the local secrets blob (namespace key || vault credential) is
+/// stored: preferentially in the OS keychain, or (when no keychain is
+/// available) as an Argon2id-passphrase-wrapped blob encrypted with
+/// XChaCha20-Poly1305.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum KeyStorage {
@@ -142,18 +188,19 @@ mod base64_array24 {
     }
 }
 
-/// Stores a freshly generated vault key, preferring the OS keychain and
-/// falling back to a passphrase-encrypted local blob if the keychain is
-/// unavailable (headless environment, CI, unsupported platform).
-fn store_vault_key(key_bytes: &[u8; 32]) -> Result<KeyStorage> {
+/// Stores a freshly assembled secrets blob (namespace key || vault
+/// credential), preferring the OS keychain and falling back to a
+/// passphrase-encrypted local blob if the keychain is unavailable (headless
+/// environment, CI, unsupported platform).
+fn store_local_secrets(secrets: &[u8]) -> Result<KeyStorage> {
     let keychain_result = (|| -> std::result::Result<(), keyring::Error> {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
-        entry.set_secret(key_bytes)
+        entry.set_secret(secrets)
     })();
 
     match keychain_result {
         Ok(()) => {
-            println!("Vault key stored in the OS keychain.");
+            println!("Vault secrets stored in the OS keychain.");
             Ok(KeyStorage::Keychain)
         }
         Err(err) => {
@@ -161,27 +208,25 @@ fn store_vault_key(key_bytes: &[u8; 32]) -> Result<KeyStorage> {
                 "OS keychain unavailable ({err}); falling back to a passphrase-encrypted local file."
             );
             let passphrase = read_new_passphrase()?;
-            encrypt_vault_key_with_passphrase(key_bytes, &passphrase)
+            encrypt_secrets_with_passphrase(secrets, &passphrase)
         }
     }
 }
 
-/// Retrieves the Vault Master Key referenced by `storage`, from the OS
-/// keychain or by decrypting the local blob with a supplied passphrase.
-fn retrieve_vault_key(storage: &KeyStorage) -> Result<[u8; 32]> {
+/// Retrieves the secrets blob referenced by `storage`, from the OS keychain
+/// or by decrypting the local blob with a supplied passphrase.
+fn retrieve_local_secrets(storage: &KeyStorage) -> Result<Vec<u8>> {
     match storage {
         KeyStorage::Keychain => {
             let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
                 .context("creating keychain entry")?;
             let secret = entry
                 .get_secret()
-                .context("reading vault key from OS keychain")?;
-            if secret.len() != 32 {
-                return Err(anyhow::anyhow!("unexpected vault key length from keychain"));
+                .context("reading vault secrets from OS keychain")?;
+            if secret.len() != SECRETS_LEN {
+                return Err(anyhow::anyhow!("unexpected secrets length from keychain"));
             }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&secret);
-            Ok(out)
+            Ok(secret)
         }
         KeyStorage::EncryptedFile {
             salt,
@@ -189,23 +234,41 @@ fn retrieve_vault_key(storage: &KeyStorage) -> Result<[u8; 32]> {
             ciphertext,
         } => {
             let passphrase = read_existing_passphrase()?;
-            decrypt_vault_key_with_passphrase(salt, nonce, ciphertext, &passphrase)
+            decrypt_secrets_with_passphrase(salt, nonce, ciphertext, &passphrase)
         }
     }
 }
 
-fn load_vault_key(cfg: &Config) -> Result<VaultKey> {
-    Ok(VaultKey(retrieve_vault_key(&cfg.vault_key)?))
+/// Loads and splits the local secrets blob into the namespace key (used for
+/// all object encryption, unchanged from SPEC-001) and the `ClientAuth`
+/// needed to sign requests (SPEC-004 §4).
+fn load_client_identity(cfg: &Config) -> Result<(VaultKey, ClientAuth)> {
+    let secrets = retrieve_local_secrets(&cfg.secrets)?;
+    if secrets.len() != SECRETS_LEN {
+        return Err(anyhow::anyhow!("unexpected secrets length"));
+    }
+    let mut namespace_key = [0u8; 32];
+    namespace_key.copy_from_slice(&secrets[..32]);
+    let mut vault_credential = [0u8; 32];
+    vault_credential.copy_from_slice(&secrets[32..]);
+    Ok((
+        VaultKey(namespace_key),
+        ClientAuth {
+            vault_id: cfg.vault_id.clone(),
+            namespace_id: cfg.namespace_id.clone(),
+            vault_credential,
+        },
+    ))
 }
 
-fn encrypt_vault_key_with_passphrase(key_bytes: &[u8; 32], passphrase: &str) -> Result<KeyStorage> {
+fn encrypt_secrets_with_passphrase(secrets: &[u8], passphrase: &str) -> Result<KeyStorage> {
     let mut salt = [0u8; nook_core::PASSPHRASE_SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
     let wrap_key = nook_core::derive_passphrase_key(passphrase.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("deriving passphrase key: {e}"))?;
-    let ciphertext = nook_core::encrypt_chunk(&wrap_key, &nonce, LOCAL_KEY_AAD, key_bytes);
+    let ciphertext = nook_core::encrypt_chunk(&wrap_key, &nonce, LOCAL_KEY_AAD, secrets);
     Ok(KeyStorage::EncryptedFile {
         salt: salt.to_vec(),
         nonce,
@@ -213,22 +276,16 @@ fn encrypt_vault_key_with_passphrase(key_bytes: &[u8; 32], passphrase: &str) -> 
     })
 }
 
-fn decrypt_vault_key_with_passphrase(
+fn decrypt_secrets_with_passphrase(
     salt: &[u8],
     nonce: &[u8; 24],
     ciphertext: &[u8],
     passphrase: &str,
-) -> Result<[u8; 32]> {
+) -> Result<Vec<u8>> {
     let wrap_key = nook_core::derive_passphrase_key(passphrase.as_bytes(), salt)
         .map_err(|e| anyhow::anyhow!("deriving passphrase key: {e}"))?;
-    let plaintext = nook_core::decrypt_chunk(&wrap_key, nonce, LOCAL_KEY_AAD, ciphertext)
-        .map_err(|_| anyhow::anyhow!("incorrect passphrase or corrupted local key file"))?;
-    if plaintext.len() != 32 {
-        return Err(anyhow::anyhow!("unexpected decrypted key length"));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&plaintext);
-    Ok(out)
+    nook_core::decrypt_chunk(&wrap_key, nonce, LOCAL_KEY_AAD, ciphertext)
+        .map_err(|_| anyhow::anyhow!("incorrect passphrase or corrupted local key file"))
 }
 
 /// Passphrase used to newly encrypt the vault key (`nook init`): supports a
@@ -264,28 +321,100 @@ fn read_existing_passphrase() -> Result<String> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { server, root } => cmd_init(server, root).await?,
+        Commands::Init {
+            server,
+            root,
+            vault_id,
+            vault_credential,
+            import_namespace,
+        } => cmd_init(server, root, vault_id, vault_credential, import_namespace).await?,
         Commands::Root { set } => cmd_root(set).await?,
         Commands::Ls { subpath } => cmd_ls(cli.server, subpath).await?,
         Commands::Tree { subpath } => cmd_tree(cli.server, subpath).await?,
         Commands::Push { subpath } => cmd_push(cli.server, subpath).await?,
         Commands::Pull { subpath } => cmd_pull(cli.server, subpath).await?,
         Commands::Status => cmd_status(cli.server).await?,
+        Commands::Namespace { action } => match action {
+            NamespaceCommand::Export => cmd_namespace_export().await?,
+        },
     }
     Ok(())
 }
 
-async fn cmd_init(server: String, root: Option<PathBuf>) -> Result<()> {
-    let vault_key = nook_core::generate_vault_key();
-    let key_storage = store_vault_key(vault_key.as_bytes())?;
+async fn cmd_init(
+    server: String,
+    root: Option<PathBuf>,
+    vault_id: String,
+    vault_credential: String,
+    import_namespace: Option<String>,
+) -> Result<()> {
+    if !nook_core::is_valid_hex_id(&vault_id) {
+        return Err(anyhow::anyhow!("--vault-id must be 64 lowercase hex characters"));
+    }
+    let vault_credential_bytes = hex::decode(&vault_credential).context("--vault-credential must be hex-encoded")?;
+    if vault_credential_bytes.len() != 32 {
+        return Err(anyhow::anyhow!("--vault-credential must decode to 32 bytes"));
+    }
+
+    let (namespace_id, namespace_key) = match import_namespace {
+        Some(bundle) => decode_namespace_bundle(&bundle)?,
+        None => {
+            let mut namespace_id_bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut namespace_id_bytes);
+            (hex::encode(namespace_id_bytes), nook_core::generate_vault_key().0)
+        }
+    };
+
+    let mut secrets = Vec::with_capacity(SECRETS_LEN);
+    secrets.extend_from_slice(&namespace_key);
+    secrets.extend_from_slice(&vault_credential_bytes);
+    let key_storage = store_local_secrets(&secrets)?;
+
     let config = Config {
         server,
         root,
-        vault_key: key_storage,
+        vault_id,
+        namespace_id,
+        secrets: key_storage,
     };
     save_config(&config)?;
     println!("Vault initialized. Keep this machine secure to retain access.");
     Ok(())
+}
+
+async fn cmd_namespace_export() -> Result<()> {
+    let cfg = load_config().context("nook not initialized; run `nook init`")?;
+    let (vault_key, auth) = load_client_identity(&cfg)?;
+    println!("{}", encode_namespace_bundle(&auth.namespace_id, vault_key.as_bytes()));
+    Ok(())
+}
+
+fn encode_namespace_bundle(namespace_id: &str, namespace_key: &[u8; 32]) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    format!("{NAMESPACE_BUNDLE_PREFIX}:{namespace_id}:{}", BASE64.encode(namespace_key))
+}
+
+fn decode_namespace_bundle(bundle: &str) -> Result<(String, [u8; 32])> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    let mut parts = bundle.splitn(3, ':');
+    let prefix = parts.next().context("malformed namespace bundle")?;
+    if prefix != NAMESPACE_BUNDLE_PREFIX {
+        return Err(anyhow::anyhow!("unrecognized namespace bundle format"));
+    }
+    let namespace_id = parts.next().context("malformed namespace bundle: missing namespace_id")?;
+    if !nook_core::is_valid_hex_id(namespace_id) {
+        return Err(anyhow::anyhow!("malformed namespace bundle: invalid namespace_id"));
+    }
+    let key_b64 = parts.next().context("malformed namespace bundle: missing key")?;
+    let key_bytes = BASE64.decode(key_b64).context("malformed namespace bundle: invalid key encoding")?;
+    if key_bytes.len() != 32 {
+        return Err(anyhow::anyhow!("malformed namespace bundle: key must be 32 bytes"));
+    }
+    let mut namespace_key = [0u8; 32];
+    namespace_key.copy_from_slice(&key_bytes);
+    Ok((namespace_id.to_string(), namespace_key))
 }
 
 async fn cmd_root(set: Option<PathBuf>) -> Result<()> {
@@ -311,10 +440,10 @@ async fn cmd_status(server_override: Option<String>) -> Result<()> {
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = load_vault_key(&cfg)?;
+    let (vault_key, auth) = load_client_identity(&cfg)?;
     let head_id = derive_head_object_id(&vault_key);
     let head_hex = hex::encode(head_id);
-    match head_object(&client, &server, &head_hex).await? {
+    match head_object(&client, &server, &auth, &head_hex).await? {
         Some(etag) => println!("Head present (etag {etag})"),
         None => println!("Head not present on server"),
     }
@@ -333,12 +462,12 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         None => root.clone(),
     };
     let client = http_client()?;
-    let vault_key = load_vault_key(&cfg)?;
+    let (vault_key, auth) = load_client_identity(&cfg)?;
 
     // Try to fetch existing manifest, or create empty one
     let head_id = derive_head_object_id(&vault_key);
     let head_hex = hex::encode(head_id);
-    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &vault_key).await {
+    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &auth, &vault_key).await {
         Ok((m, e)) => (m, e),
         Err(ManifestFetchError::NotFound) => {
             // No existing manifest, create a new one with root directory
@@ -507,9 +636,9 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
 
     for (object_id, bytes) in uploads {
         let hex_id = hex::encode(object_id);
-        put_object(&client, &server, &hex_id, bytes, None).await?;
+        put_object(&client, &server, &auth, &hex_id, bytes, None).await?;
     }
-    put_object(&client, &server, &head_hex, manifest_serialized, etag.as_deref()).await?;
+    put_object(&client, &server, &auth, &head_hex, manifest_serialized, etag.as_deref()).await?;
 
     println!("Push complete.");
     Ok(())
@@ -611,14 +740,19 @@ enum ManifestFetchError {
 async fn fetch_manifest_with_etag(
     client: &Client,
     server: &str,
+    auth: &ClientAuth,
     vault_key: &VaultKey,
 ) -> std::result::Result<(Manifest, Option<String>), ManifestFetchError> {
     let head_id = derive_head_object_id(vault_key);
     let head_hex = hex::encode(head_id);
 
-    let url = format!("{server}/v1/obj/{head_hex}");
+    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, &head_hex);
+    let url = format!("{server}{path}");
+    let headers = signed_headers(auth, "GET", &path, b"")
+        .map_err(|e| ManifestFetchError::Other(e.context("signing manifest request")))?;
     let res = client
         .get(&url)
+        .headers(headers)
         .send()
         .await
         .map_err(|e| ManifestFetchError::Other(anyhow::Error::new(e).context("requesting manifest")))?;
@@ -662,8 +796,8 @@ async fn cmd_ls(server_override: Option<String>, subpath: Option<PathBuf>) -> Re
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = load_vault_key(&cfg)?;
-    let manifest = fetch_manifest(&client, &server, &vault_key).await?;
+    let (vault_key, auth) = load_client_identity(&cfg)?;
+    let manifest = fetch_manifest(&client, &server, &auth, &vault_key).await?;
 
     let (nodes_by_id, children_by_id) = index_manifest(&manifest);
     let target_id = match subpath {
@@ -706,8 +840,8 @@ async fn cmd_tree(server_override: Option<String>, subpath: Option<PathBuf>) -> 
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = load_vault_key(&cfg)?;
-    let manifest = fetch_manifest(&client, &server, &vault_key).await?;
+    let (vault_key, auth) = load_client_identity(&cfg)?;
+    let manifest = fetch_manifest(&client, &server, &auth, &vault_key).await?;
 
     let (nodes_by_id, children_by_id) = index_manifest(&manifest);
     let target_id = match subpath {
@@ -789,8 +923,8 @@ async fn cmd_pull(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         .context("set root via `nook root --set <path>` before pulling")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = load_vault_key(&cfg)?;
-    let manifest = fetch_manifest(&client, &server, &vault_key).await?;
+    let (vault_key, auth) = load_client_identity(&cfg)?;
+    let manifest = fetch_manifest(&client, &server, &auth, &vault_key).await?;
 
     let (nodes_by_id, children_by_id) = index_manifest(&manifest);
 
@@ -860,7 +994,7 @@ async fn cmd_pull(server_override: Option<String>, subpath: Option<PathBuf>) -> 
                 if let Some(parent) = path.parent() {
                     tokio_fs::create_dir_all(parent).await?;
                 }
-                pull_file(&client, &server, &vault_key, node, path).await?;
+                pull_file(&client, &server, &auth, &vault_key, node, path).await?;
             }
         }
     }
@@ -872,6 +1006,7 @@ async fn cmd_pull(server_override: Option<String>, subpath: Option<PathBuf>) -> 
 async fn pull_file(
     client: &Client,
     server: &str,
+    auth: &ClientAuth,
     vault_key: &VaultKey,
     node: &Node,
     path: &Path,
@@ -881,7 +1016,7 @@ async fn pull_file(
         .context("file entry missing object id")?;
     let wrapped_dek = node.wrapped_dek.clone().context("missing wrapped dek")?;
     let wrapped = WrappedKey(wrapped_dek);
-    let cipher_bytes = get_object(client, server, &hex::encode(object_id)).await?;
+    let cipher_bytes = get_object(client, server, auth, &hex::encode(object_id)).await?;
     let (wrapped_from_object, chunks) = nook_core::deserialize_encrypted_object(&cipher_bytes)?;
     // Prefer manifest's wrapped key but fall back if object envelope differs.
     let wrapped_to_use = if !wrapped_from_object.0.is_empty() {
@@ -945,9 +1080,36 @@ fn http_client() -> Result<Client> {
     Ok(client)
 }
 
-async fn head_object(client: &Client, server: &str, object_id_hex: &str) -> Result<Option<String>> {
-    let url = format!("{server}/v1/obj/{object_id_hex}");
-    let res = client.head(url).send().await?;
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Builds the `X-Nook-Timestamp`/`X-Nook-Signature` headers for a request,
+/// signed with the vault credential. The credential itself never appears in
+/// the request (SPEC-004 §4).
+fn signed_headers(auth: &ClientAuth, method: &str, path: &str, body: &[u8]) -> Result<HeaderMap> {
+    let timestamp = now_unix();
+    let signature = nook_core::sign_request(&auth.vault_credential, method, path, timestamp, body);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Nook-Timestamp",
+        HeaderValue::from_str(&timestamp.to_string()).context("invalid timestamp header")?,
+    );
+    headers.insert(
+        "X-Nook-Signature",
+        HeaderValue::from_str(&signature).context("invalid signature header")?,
+    );
+    Ok(headers)
+}
+
+async fn head_object(client: &Client, server: &str, auth: &ClientAuth, object_id_hex: &str) -> Result<Option<String>> {
+    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+    let url = format!("{server}{path}");
+    let headers = signed_headers(auth, "HEAD", &path, b"")?;
+    let res = client.head(url).headers(headers).send().await?;
     match res.status() {
         reqwest::StatusCode::OK => Ok(res
             .headers()
@@ -955,6 +1117,9 @@ async fn head_object(client: &Client, server: &str, object_id_hex: &str) -> Resu
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())),
         reqwest::StatusCode::NOT_FOUND => Ok(None),
+        reqwest::StatusCode::UNAUTHORIZED => {
+            Err(anyhow::anyhow!("unauthorized: check vault ID/credential"))
+        }
         other => Err(anyhow::anyhow!("HEAD failed with status {other}")),
     }
 }
@@ -962,12 +1127,14 @@ async fn head_object(client: &Client, server: &str, object_id_hex: &str) -> Resu
 async fn put_object(
     client: &Client,
     server: &str,
+    auth: &ClientAuth,
     object_id_hex: &str,
     bytes: Vec<u8>,
     etag: Option<&str>,
 ) -> Result<()> {
-    let url = format!("{server}/v1/obj/{object_id_hex}");
-    let mut headers = HeaderMap::new();
+    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+    let url = format!("{server}{path}");
+    let mut headers = signed_headers(auth, "PUT", &path, &bytes)?;
     if let Some(tag) = etag {
         headers.insert(
             IF_MATCH,
@@ -980,13 +1147,21 @@ async fn put_object(
         reqwest::StatusCode::PRECONDITION_FAILED => {
             Err(anyhow::anyhow!("CAS failure: head modified concurrently"))
         }
+        reqwest::StatusCode::INSUFFICIENT_STORAGE => {
+            Err(anyhow::anyhow!("vault quota exceeded"))
+        }
+        reqwest::StatusCode::UNAUTHORIZED => {
+            Err(anyhow::anyhow!("unauthorized: check vault ID/credential"))
+        }
         other => Err(anyhow::anyhow!("PUT failed with status {other}")),
     }
 }
 
-async fn get_object(client: &Client, server: &str, object_id_hex: &str) -> Result<Vec<u8>> {
-    let url = format!("{server}/v1/obj/{object_id_hex}");
-    let res = client.get(url).send().await?;
+async fn get_object(client: &Client, server: &str, auth: &ClientAuth, object_id_hex: &str) -> Result<Vec<u8>> {
+    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+    let url = format!("{server}{path}");
+    let headers = signed_headers(auth, "GET", &path, b"")?;
+    let res = client.get(url).headers(headers).send().await?;
     if res.status().is_success() {
         let bytes = res.bytes().await?;
         return Ok(bytes.to_vec());
@@ -994,16 +1169,19 @@ async fn get_object(client: &Client, server: &str, object_id_hex: &str) -> Resul
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(anyhow::anyhow!("object {object_id_hex} not found"));
     }
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(anyhow::anyhow!("unauthorized: check vault ID/credential"));
+    }
     Err(anyhow::anyhow!(
         "GET failed with status {}",
         res.status()
     ))
 }
 
-async fn fetch_manifest(client: &Client, server: &str, vault_key: &VaultKey) -> Result<Manifest> {
+async fn fetch_manifest(client: &Client, server: &str, auth: &ClientAuth, vault_key: &VaultKey) -> Result<Manifest> {
     let head_id = derive_head_object_id(vault_key);
     let head_hex = hex::encode(head_id);
-    let manifest_bytes = get_object(client, server, &head_hex)
+    let manifest_bytes = get_object(client, server, auth, &head_hex)
         .await
         .context("manifest not found; push first")?;
     let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes)?;

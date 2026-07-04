@@ -3,6 +3,13 @@ mod support;
 use std::fs;
 use support::run_nook;
 
+/// A well-formed but made-up vault_id/vault_credential: `nook init` only
+/// validates their shape locally (64 hex chars / 32 bytes) and never
+/// contacts the server during init, so these don't need to correspond to a
+/// real vault for these config-file-shape and passphrase tests.
+const FAKE_VAULT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const FAKE_VAULT_CREDENTIAL: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 /// `run_nook`'s support helper always sets `NOOK_PASSPHRASE`, and this
 /// sandboxed test environment has no OS keychain daemon available, so
 /// `nook init` is expected to take the passphrase-encrypted-local-file
@@ -11,7 +18,18 @@ fn init_fresh_config() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let config_home = tmp.path().join("config");
     fs::create_dir_all(&config_home).unwrap();
-    let init = run_nook(&config_home, &["init", "--server", "http://127.0.0.1:1"]);
+    let init = run_nook(
+        &config_home,
+        &[
+            "init",
+            "--server",
+            "http://127.0.0.1:1",
+            "--vault-id",
+            FAKE_VAULT_ID,
+            "--vault-credential",
+            FAKE_VAULT_CREDENTIAL,
+        ],
+    );
     assert!(init.status.success(), "init failed: {init:?}");
     (tmp, config_home)
 }
@@ -40,9 +58,10 @@ fn init_produces_valid_toml_with_no_recoverable_key_material() {
 
     let parsed: toml::Value = toml::from_str(&contents).expect("config must be valid TOML");
     assert!(parsed.get("server").is_some());
+    assert_eq!(parsed.get("vault_id").and_then(|v| v.as_str()), Some(FAKE_VAULT_ID));
 
-    let vault_key = parsed.get("vault_key").expect("vault_key table present");
-    let mode = vault_key.get("mode").and_then(|v| v.as_str());
+    let secrets = parsed.get("secrets").expect("secrets table present");
+    let mode = secrets.get("mode").and_then(|v| v.as_str());
     assert_eq!(
         mode,
         Some("encrypted_file"),
@@ -50,11 +69,11 @@ fn init_produces_valid_toml_with_no_recoverable_key_material() {
     );
 
     // The only byte-ish fields present are salt/nonce/ciphertext, which are
-    // legitimate encrypted material, not the raw 32-byte vault key. A raw
-    // key would appear as its own unlabeled 32-byte base64 blob under
-    // `vault_key` directly; instead every field here is one of the expected
-    // three ciphertext components.
-    let table = vault_key.as_table().expect("vault_key is a table");
+    // legitimate encrypted material, not the raw namespace key or vault
+    // credential. Those would appear as their own unlabeled base64 blobs
+    // directly under `secrets`; instead every field here is one of the
+    // expected three ciphertext components.
+    let table = secrets.as_table().expect("secrets is a table");
     let mut keys: Vec<&str> = table.keys().map(|s| s.as_str()).collect();
     keys.sort();
     assert_eq!(keys, vec!["ciphertext", "mode", "nonce", "salt"]);

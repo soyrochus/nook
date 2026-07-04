@@ -26,4 +26,9 @@ USER nookd
 WORKDIR /data
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/nookd"]
-CMD ["--listen", "0.0.0.0:8080"]
+CMD ["serve", "--listen", "0.0.0.0:8080"]
+
+# To create/manage vaults against this same mounted volume, run the vault
+# CLI as a one-off container overriding the default command, e.g.:
+#   podman run --rm -v nookd-data:/data --entrypoint /usr/local/bin/nookd nookd \
+#     vault create --storage /data

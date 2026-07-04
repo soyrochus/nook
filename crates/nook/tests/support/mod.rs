@@ -51,12 +51,12 @@ impl Nookd {
         let bin = ensure_built("nookd");
         let addr = free_addr();
         let child = Command::new(bin)
-            .args(["--listen", &addr, "--storage"])
+            .args(["serve", "--listen", &addr, "--storage"])
             .arg(storage)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to spawn nookd");
+            .expect("failed to spawn nookd serve");
         let server = Nookd { child, addr };
         server.wait_ready();
         server
@@ -82,6 +82,33 @@ impl Drop for Nookd {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Runs `nookd vault create --storage <dir>` and parses the printed
+/// `vault_id`/`vault_credential` (hex-encoded), for use with `nook init
+/// --vault-id ... --vault-credential ...` in tests.
+pub fn create_vault(storage: &Path) -> (String, String) {
+    let bin = ensure_built("nookd");
+    let out = Command::new(bin)
+        .args(["vault", "create", "--storage"])
+        .arg(storage)
+        .output()
+        .expect("failed to run nookd vault create");
+    assert!(out.status.success(), "nookd vault create failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let vault_id = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("vault_id:         "))
+        .expect("vault_id in output")
+        .trim()
+        .to_string();
+    let vault_credential = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("vault_credential: "))
+        .expect("vault_credential in output")
+        .trim()
+        .to_string();
+    (vault_id, vault_credential)
 }
 
 /// Runs `nook` as a subprocess with an isolated config directory (via

@@ -5,6 +5,17 @@
 
 ---
 
+**Terminology note (amended by `specs/SPEC-004-multi-vault-user-concurrecny-changes.md`).**
+Everywhere below, "vault" and "Vault Master Key (VMK)" refer to the
+client-side encryption domain described in §7–§9 (one key, one head object,
+one manifest). SPEC-004 renames this concept to **namespace**/**namespace
+key** and reassigns "vault" to mean a new, separate server-side access and
+storage container introduced there. No cryptographic behavior changes: read
+"namespace"/"namespace key" wherever this document says "vault"/"VMK". See
+SPEC-004 §0 and §2 for the full model.
+
+---
+
 ## 1. Purpose and non-negotiable properties
 
 Nook is a minimal private file vault designed to operate correctly in **fully untrusted environments**, including:
@@ -211,6 +222,11 @@ Server never sees keys.
 
 ## 11. Server API (generic blob store)
 
+**Superseded by SPEC-004 §5**, which re-addresses these same three verbs as
+`/v1/vault/{vault_id}/ns/{namespace_id}/obj/{object_id}` and adds required
+request signing. The object semantics (CAS, no semantic endpoints) below are
+otherwise unchanged.
+
 There are **exactly three endpoints**.
 
 ### Upload / replace object
@@ -306,6 +322,9 @@ Subpaths are **local only**.
 ---
 
 ## 16. Server storage layout
+
+**Superseded by SPEC-004 §7**, which nests object storage and `meta.sqlite`
+under `vault_id`/`namespace_id` and adds a `vaults` table.
 
 ```
 /storage
