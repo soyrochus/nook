@@ -90,6 +90,9 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh cannot infer the repo from a git
+          # remote; point it at the repo explicitly.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release create "${{ github.ref_name }}" dist/* \
