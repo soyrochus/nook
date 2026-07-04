@@ -20,3 +20,6 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }
 walkdir = "2"
+keyring = { version = "4.1.3", features = ["apple-native-keyring-store"] }
+rpassword = "7.5.4"
+toml = "1.1.2"

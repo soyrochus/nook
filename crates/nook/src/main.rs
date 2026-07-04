@@ -17,6 +17,20 @@ use std::path::{Component, Path, PathBuf};
 use tokio::fs as tokio_fs;
 use walkdir::WalkDir;
 
+/// Fixed keychain coordinates for the vault key. Only one vault config
+/// exists per machine (single fixed config path), so a constant service and
+/// account name is sufficient to locate the secret.
+const KEYCHAIN_SERVICE: &str = "dev.nook.vault";
+const KEYCHAIN_ACCOUNT: &str = "vault_key";
+
+/// Associated data binding the passphrase-wrapped vault key to its purpose,
+/// so it can never be confused with any other ciphertext produced by nook.
+const LOCAL_KEY_AAD: &[u8] = b"nook-local-vault-key-v1";
+
+/// Environment variable allowing non-interactive passphrase supply for
+/// scripted or CI use of the encrypted-local-file fallback.
+const PASSPHRASE_ENV_VAR: &str = "NOOK_PASSPHRASE";
+
 #[derive(Parser)]
 #[command(author, version, about = "Nook CLI — encrypted push/pull vault")]
 struct Cli {
@@ -53,39 +67,197 @@ enum Commands {
     Status,
 }
 
+/// Client configuration, persisted as TOML. `vault_key` is always an opaque
+/// reference (a keychain marker or an encrypted blob) — never the raw
+/// Vault Master Key — so the config file alone never discloses key material.
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
     server: String,
-    #[serde(with = "base64_bytes")]
-    vault_key: [u8; 32],
     root: Option<PathBuf>,
+    vault_key: KeyStorage,
 }
 
-mod base64_bytes {
+/// How the Vault Master Key is stored: preferentially in the OS keychain, or
+/// (when no keychain is available) as an Argon2id-passphrase-wrapped blob
+/// encrypted with XChaCha20-Poly1305.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum KeyStorage {
+    Keychain,
+    EncryptedFile {
+        #[serde(with = "base64_vec")]
+        salt: Vec<u8>,
+        #[serde(with = "base64_array24")]
+        nonce: [u8; 24],
+        #[serde(with = "base64_vec")]
+        ciphertext: Vec<u8>,
+    },
+}
+
+mod base64_vec {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
     use serde::{self, Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&BASE64.encode(bytes))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+    }
+}
+
+mod base64_array24 {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 24], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 24], D::Error>
     where
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         let decoded = BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom)?;
-        let mut out = [0u8; 32];
-        if decoded.len() != 32 {
-            return Err(serde::de::Error::custom("expected 32-byte key"));
+        let mut out = [0u8; 24];
+        if decoded.len() != 24 {
+            return Err(serde::de::Error::custom("expected 24-byte nonce"));
         }
         out.copy_from_slice(&decoded);
         Ok(out)
     }
+}
+
+/// Stores a freshly generated vault key, preferring the OS keychain and
+/// falling back to a passphrase-encrypted local blob if the keychain is
+/// unavailable (headless environment, CI, unsupported platform).
+fn store_vault_key(key_bytes: &[u8; 32]) -> Result<KeyStorage> {
+    let keychain_result = (|| -> std::result::Result<(), keyring::Error> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        entry.set_secret(key_bytes)
+    })();
+
+    match keychain_result {
+        Ok(()) => {
+            println!("Vault key stored in the OS keychain.");
+            Ok(KeyStorage::Keychain)
+        }
+        Err(err) => {
+            eprintln!(
+                "OS keychain unavailable ({err}); falling back to a passphrase-encrypted local file."
+            );
+            let passphrase = read_new_passphrase()?;
+            encrypt_vault_key_with_passphrase(key_bytes, &passphrase)
+        }
+    }
+}
+
+/// Retrieves the Vault Master Key referenced by `storage`, from the OS
+/// keychain or by decrypting the local blob with a supplied passphrase.
+fn retrieve_vault_key(storage: &KeyStorage) -> Result<[u8; 32]> {
+    match storage {
+        KeyStorage::Keychain => {
+            let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .context("creating keychain entry")?;
+            let secret = entry
+                .get_secret()
+                .context("reading vault key from OS keychain")?;
+            if secret.len() != 32 {
+                return Err(anyhow::anyhow!("unexpected vault key length from keychain"));
+            }
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&secret);
+            Ok(out)
+        }
+        KeyStorage::EncryptedFile {
+            salt,
+            nonce,
+            ciphertext,
+        } => {
+            let passphrase = read_existing_passphrase()?;
+            decrypt_vault_key_with_passphrase(salt, nonce, ciphertext, &passphrase)
+        }
+    }
+}
+
+fn load_vault_key(cfg: &Config) -> Result<VaultKey> {
+    Ok(VaultKey(retrieve_vault_key(&cfg.vault_key)?))
+}
+
+fn encrypt_vault_key_with_passphrase(key_bytes: &[u8; 32], passphrase: &str) -> Result<KeyStorage> {
+    let mut salt = [0u8; nook_core::PASSPHRASE_SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let wrap_key = nook_core::derive_passphrase_key(passphrase.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("deriving passphrase key: {e}"))?;
+    let ciphertext = nook_core::encrypt_chunk(&wrap_key, &nonce, LOCAL_KEY_AAD, key_bytes);
+    Ok(KeyStorage::EncryptedFile {
+        salt: salt.to_vec(),
+        nonce,
+        ciphertext,
+    })
+}
+
+fn decrypt_vault_key_with_passphrase(
+    salt: &[u8],
+    nonce: &[u8; 24],
+    ciphertext: &[u8],
+    passphrase: &str,
+) -> Result<[u8; 32]> {
+    let wrap_key = nook_core::derive_passphrase_key(passphrase.as_bytes(), salt)
+        .map_err(|e| anyhow::anyhow!("deriving passphrase key: {e}"))?;
+    let plaintext = nook_core::decrypt_chunk(&wrap_key, nonce, LOCAL_KEY_AAD, ciphertext)
+        .map_err(|_| anyhow::anyhow!("incorrect passphrase or corrupted local key file"))?;
+    if plaintext.len() != 32 {
+        return Err(anyhow::anyhow!("unexpected decrypted key length"));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&plaintext);
+    Ok(out)
+}
+
+/// Passphrase used to newly encrypt the vault key (`nook init`): supports a
+/// non-interactive override via `NOOK_PASSPHRASE` for scripted/CI use, and
+/// otherwise prompts twice to guard against typos.
+fn read_new_passphrase() -> Result<String> {
+    if let Ok(p) = std::env::var(PASSPHRASE_ENV_VAR) {
+        return Ok(p);
+    }
+    let first = rpassword::prompt_password("Enter a passphrase to protect the vault key: ")
+        .context("reading passphrase")?;
+    if first.is_empty() {
+        return Err(anyhow::anyhow!("passphrase must not be empty"));
+    }
+    let confirm =
+        rpassword::prompt_password("Confirm passphrase: ").context("reading passphrase confirmation")?;
+    if first != confirm {
+        return Err(anyhow::anyhow!("passphrases did not match"));
+    }
+    Ok(first)
+}
+
+/// Passphrase used to decrypt an existing vault key: same non-interactive
+/// override, single prompt otherwise.
+fn read_existing_passphrase() -> Result<String> {
+    if let Ok(p) = std::env::var(PASSPHRASE_ENV_VAR) {
+        return Ok(p);
+    }
+    rpassword::prompt_password("Enter vault passphrase: ").context("reading passphrase")
 }
 
 #[tokio::main]
@@ -105,10 +277,11 @@ async fn main() -> Result<()> {
 
 async fn cmd_init(server: String, root: Option<PathBuf>) -> Result<()> {
     let vault_key = nook_core::generate_vault_key();
+    let key_storage = store_vault_key(vault_key.as_bytes())?;
     let config = Config {
         server,
-        vault_key: vault_key.0,
         root,
+        vault_key: key_storage,
     };
     save_config(&config)?;
     println!("Vault initialized. Keep this machine secure to retain access.");
@@ -138,7 +311,7 @@ async fn cmd_status(server_override: Option<String>) -> Result<()> {
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = VaultKey(cfg.vault_key);
+    let vault_key = load_vault_key(&cfg)?;
     let head_id = derive_head_object_id(&vault_key);
     let head_hex = hex::encode(head_id);
     match head_object(&client, &server, &head_hex).await? {
@@ -160,14 +333,14 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         None => root.clone(),
     };
     let client = http_client()?;
-    let vault_key = VaultKey(cfg.vault_key);
+    let vault_key = load_vault_key(&cfg)?;
 
     // Try to fetch existing manifest, or create empty one
     let head_id = derive_head_object_id(&vault_key);
     let head_hex = hex::encode(head_id);
     let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &vault_key).await {
         Ok((m, e)) => (m, e),
-        Err(_) => {
+        Err(ManifestFetchError::NotFound) => {
             // No existing manifest, create a new one with root directory
             let new_manifest = Manifest {
                 manifest_version: 1,
@@ -189,6 +362,11 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
                 integrity_checksum: String::new(),
             };
             (new_manifest, None)
+        }
+        Err(ManifestFetchError::Other(e)) => {
+            return Err(e.context(
+                "failed to fetch or decrypt the existing manifest; aborting push without modifying server state",
+            ));
         }
     };
 
@@ -421,22 +599,38 @@ fn ensure_path_exists(
     Ok(current_id)
 }
 
+/// Distinguishes "manifest object does not exist yet" (safe to treat as an
+/// empty vault) from every other failure mode, which must abort the push
+/// rather than silently fabricating a replacement manifest.
+#[derive(Debug)]
+enum ManifestFetchError {
+    NotFound,
+    Other(anyhow::Error),
+}
+
 async fn fetch_manifest_with_etag(
     client: &Client,
     server: &str,
     vault_key: &VaultKey,
-) -> Result<(Manifest, Option<String>)> {
+) -> std::result::Result<(Manifest, Option<String>), ManifestFetchError> {
     let head_id = derive_head_object_id(vault_key);
     let head_hex = hex::encode(head_id);
 
     let url = format!("{server}/v1/obj/{head_hex}");
-    let res = client.get(&url).send().await?;
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| ManifestFetchError::Other(anyhow::Error::new(e).context("requesting manifest")))?;
 
     if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(anyhow::anyhow!("manifest not found"));
+        return Err(ManifestFetchError::NotFound);
     }
     if !res.status().is_success() {
-        return Err(anyhow::anyhow!("GET failed with status {}", res.status()));
+        return Err(ManifestFetchError::Other(anyhow::anyhow!(
+            "GET failed with status {}",
+            res.status()
+        )));
     }
 
     let etag = res
@@ -445,11 +639,21 @@ async fn fetch_manifest_with_etag(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    let manifest_bytes = res.bytes().await?.to_vec();
-    let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes)?;
-    let decrypted = decrypt_object(head_id, &wrapped, &chunks, vault_key)?;
-    let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext)?;
-    manifest.validate_integrity()?;
+    let manifest_bytes = res
+        .bytes()
+        .await
+        .map_err(|e| ManifestFetchError::Other(anyhow::Error::new(e).context("reading manifest body")))?
+        .to_vec();
+    let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes).map_err(|e| {
+        ManifestFetchError::Other(anyhow::anyhow!("deserializing manifest envelope: {e}"))
+    })?;
+    let decrypted = decrypt_object(head_id, &wrapped, &chunks, vault_key)
+        .map_err(|e| ManifestFetchError::Other(anyhow::anyhow!("decrypting manifest: {e}")))?;
+    let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext)
+        .map_err(|e| ManifestFetchError::Other(anyhow::Error::new(e).context("parsing manifest JSON")))?;
+    manifest
+        .validate_integrity()
+        .map_err(|e| ManifestFetchError::Other(anyhow::anyhow!("manifest integrity check failed: {e}")))?;
 
     Ok((manifest, etag))
 }
@@ -458,7 +662,7 @@ async fn cmd_ls(server_override: Option<String>, subpath: Option<PathBuf>) -> Re
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = VaultKey(cfg.vault_key);
+    let vault_key = load_vault_key(&cfg)?;
     let manifest = fetch_manifest(&client, &server, &vault_key).await?;
 
     let (nodes_by_id, children_by_id) = index_manifest(&manifest);
@@ -502,7 +706,7 @@ async fn cmd_tree(server_override: Option<String>, subpath: Option<PathBuf>) -> 
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = VaultKey(cfg.vault_key);
+    let vault_key = load_vault_key(&cfg)?;
     let manifest = fetch_manifest(&client, &server, &vault_key).await?;
 
     let (nodes_by_id, children_by_id) = index_manifest(&manifest);
@@ -585,7 +789,7 @@ async fn cmd_pull(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         .context("set root via `nook root --set <path>` before pulling")?;
     let server = server_override.unwrap_or(cfg.server.clone());
     let client = http_client()?;
-    let vault_key = VaultKey(cfg.vault_key);
+    let vault_key = load_vault_key(&cfg)?;
     let manifest = fetch_manifest(&client, &server, &vault_key).await?;
 
     let (nodes_by_id, children_by_id) = index_manifest(&manifest);
@@ -885,8 +1089,10 @@ fn print_entry(node: &Node) {
 
 fn load_config() -> Result<Config> {
     let path = config_path()?;
-    let data = fs::read(&path).context("missing config; run `nook init`")?;
-    let cfg: Config = serde_json::from_slice(&data)?;
+    let data = fs::read_to_string(&path).context("missing config; run `nook init`")?;
+    let cfg: Config = toml::from_str(&data).context(
+        "failed to parse config as TOML (configs from older nook versions are not migrated automatically; re-run `nook init`)",
+    )?;
     Ok(cfg)
 }
 
@@ -895,7 +1101,7 @@ fn save_config(cfg: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_vec_pretty(cfg)?;
+    let data = toml::to_string_pretty(cfg).context("serializing config")?;
     fs::write(path, data)?;
     Ok(())
 }
@@ -903,5 +1109,5 @@ fn save_config(cfg: &Config) -> Result<()> {
 fn config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("dev", "nook", "nook")
         .context("cannot determine config directory for this platform")?;
-    Ok(dirs.config_dir().join("config.json"))
+    Ok(dirs.config_dir().join("config.toml"))
 }

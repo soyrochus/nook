@@ -328,7 +328,36 @@ No semantic data.
 
 ## 17. Wire format (encrypted object layout)
 
-Each stored object is a sequence of encrypted chunks.
+Each stored object is a sequence of encrypted chunks, prefixed with an outer
+envelope that carries the wrapped DEK needed to decrypt those chunks in the
+first place.
+
+### On-wire envelope
+
+This is the actual byte layout produced/consumed by
+`serialize_encrypted_object`/`deserialize_encrypted_object`:
+
+```
+[u16 le: wrapped_dek_len]
+[wrapped_dek_len bytes: wrapped_dek]   // WrappedKey — AEAD ciphertext under the VMK-derived wrap key
+[u32 le: chunk_count]
+repeated chunk_count times:
+  [u32 le: chunk_len]
+  [chunk_len bytes: chunk ciphertext]
+```
+
+The wrapped DEK must be readable *before* any chunk can be decrypted (it is
+what unlocks the DEK used for every chunk, including chunk 0), so it cannot
+itself live only inside the encrypted chunk-0 header — it is carried in the
+clear in this outer envelope. This is safe: the wrapped DEK is itself AEAD
+ciphertext (encrypted with the VMK-derived wrap key via `wrap_data_key`), so
+exposing it outside the chunk stream does not expose the DEK or any
+plaintext. The wrapped DEK is *also* embedded (redundantly) inside the
+encrypted chunk-0 header below; `decrypt_object` MUST assert, after
+decrypting the header, that the header's `wrapped_dek` matches the outer
+envelope's `wrapped_dek` byte-for-byte, and MUST fail closed (per §18 — all
+decrypt failures are fatal) if they differ. This turns the redundant copy
+into a checked invariant rather than a silent-divergence risk.
 
 ### Encrypted object header (chunk 0, plaintext before encryption)
 
@@ -345,6 +374,7 @@ struct ObjectHeader {
 
 * Header is encrypted with DEK.
 * `object_type` is not visible outside encryption.
+* `wrapped_dek` here must equal the outer envelope's wrapped DEK (see above).
 
 ### Chunk structure
 
@@ -444,15 +474,21 @@ Not guaranteed:
 
 ## 21. Repository structure
 
+`specs/` (not `docs/`) is the canonical location for specification
+documents — this matches the layout already in active use (SPEC-001,
+SPEC-002, SPEC-003).
+
 ```
 /
  ├─ crates/
  │   ├─ nook-core
  │   ├─ nook
  │   └─ nookd
- ├─ docs/
- │   ├─ SPEC.md
- │   └─ SECURITY.md
+ ├─ specs/
+ │   ├─ SPEC-001-Base Implementation.md
+ │   ├─ SPEC-002-FileNavigation.md
+ │   └─ SPEC-003-implementation-fixes.md
+ ├─ SECURITY.md
  └─ .github/workflows/ci.yml
 ```
 

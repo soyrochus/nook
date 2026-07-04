@@ -6,10 +6,12 @@
 
 **Your private Dropbox—encrypted end-to-end, even from the server.**
 
-Push and pull files through hostile networks, traffic-intercepting proxies, and compromised servers—without revealing a single filename.
+Push and pull files through hostile networks, traffic-intercepting proxies, and compromised servers—without revealing a single filename nor bit of data.
 
 ![Nook](./images/nook-logo-small.png)
 
+> A nook is a small, quiet, or sheltered area, such as a cozy corner in a room, an alcove, or a secluded spot in nature. The term often implies privacy, comfort, or a space set aside for a specific purpose, like a "breakfast nook" or a "reading nook."
+> 
 ## Overview
 
 Nook is a minimal private file vault designed to operate correctly in **fully untrusted environments**, including TLS-intercepting firewalls, corporate MITM proxies, hostile networks, and server compromise scenarios.
@@ -77,15 +79,54 @@ storage/
   meta.sqlite
 ```
 
+The storage directory is also settable via `NOOK_DATA_DIR`, and a total storage quota (in bytes)
+via `--quota-bytes`/`NOOK_QUOTA_BYTES` (unset means unlimited); uploads that would exceed the quota
+are rejected with `507 Insufficient Storage`.
+
+### Run the server in a container (Podman / Docker)
+
+```bash
+podman build -f crates/nookd/Dockerfile -t nookd .
+podman volume create nookd-data
+podman run -d --name nookd -p 8080:8080 -v nookd-data:/data nookd
+```
+
+The container declares `/data` as a `VOLUME` — the object store and `meta.sqlite` live there, so a
+named volume (as above) or a bind mount keeps data across container recreation. `docker` works the
+same way (swap `podman` for `docker`).
+
+To use a host directory instead of a named volume, the directory must be writable by the
+container's fixed user (UID/GID `10001`). With rootless Podman, set that up via `podman unshare`
+so the ownership is correct inside the container's user namespace:
+
+```bash
+mkdir -p ./data
+podman unshare chown 10001:10001 ./data
+podman run -d --name nookd -p 8080:8080 -v ./data:/data:Z nookd
+```
+
+With Docker (no user namespace remapping by default), a plain `chown 10001:10001 ./data` on the
+host is enough.
+
 ## Initialize a vault (client)
 
 ```bash
 ./target/release/nook init --server http://127.0.0.1:8080 --root /path/to/vault
 ```
 
-This generates a vault key and writes client config to the platform config directory
-(`~/.config/nook/config.json` on Linux). Keep this file secure; you need the same vault key on
-other devices.
+This generates a vault key and stores it in the OS keychain by default (macOS Keychain, Windows
+Credential Manager, or the Secret Service on Linux). If no keychain is available — headless
+servers, CI, some Linux setups — `nook init` falls back to encrypting the key with a
+passphrase (Argon2id + XChaCha20-Poly1305) and storing the encrypted blob in the client config.
+Set `NOOK_PASSPHRASE` to supply the passphrase non-interactively (scripted/CI use); otherwise
+`nook init` prompts for it.
+
+Client config is written as TOML to the platform config directory (`~/.config/nook/config.toml`
+on Linux). The vault key is never written there in recoverable form — only a keychain reference or
+an encrypted blob. To use the same vault on another device: a keychain-backed vault key cannot be
+transferred by copying the config file alone, since the keychain entry itself stays on the
+original device — use the passphrase-encrypted fallback instead, so the config file becomes
+portable (copy `config.toml` and share the passphrase through a separate secure channel).
 
 Set or view the local root later:
 
@@ -152,8 +193,8 @@ All discovery happens locally by decrypting the manifest—no server queries rev
 - The server is a semantic null: it stores only ciphertext and object IDs.
 - TLS can be used, but confidentiality does not rely on it; TLS MITM does not expose filenames,
   paths, or file contents.
-- To use the same vault on multiple devices, copy the `config.json` (or at least the vault key)
-  securely, then set the local root on each device.
+- To use the same vault on multiple devices, see the vault-key portability note above, then set
+  the local root on each device.
 
 ## Participation
 
@@ -164,5 +205,5 @@ This project follows the [FOSS Pluralism Manifesto](./FOSS_PLURALISM_MANIFESTO.m
 
 ## License
 
-Copyright (c) 2026, Iwan van der Kleijn
+Copyright (c) 2026 Iwan van der Kleijn
 Licensed under the MIT License. See [`LICENSE`](./LICENSE) for details.

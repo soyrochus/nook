@@ -1,4 +1,5 @@
 use crate::{NookError, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
@@ -135,6 +136,24 @@ pub fn decrypt_chunk(
             },
         )
         .map_err(|_| NookError::Crypto("decrypt_chunk failed".into()))
+}
+
+/// Length in bytes of the random salt used for `derive_passphrase_key`.
+pub const PASSPHRASE_SALT_LEN: usize = 16;
+
+/// Derives a 32-byte wrapping key from a user passphrase via Argon2id, for
+/// encrypting the Vault Master Key at rest when no OS keychain is available.
+/// Uses a conservative interactive profile (19 MiB memory, 2 iterations, 1
+/// lane), per OWASP password-hashing guidance.
+pub fn derive_passphrase_key(passphrase: &[u8], salt: &[u8]) -> Result<DataKey> {
+    let params = Params::new(19_456, 2, 1, Some(32))
+        .map_err(|e| NookError::Crypto(format!("invalid argon2 parameters: {e}")))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase, salt, &mut out)
+        .map_err(|e| NookError::Crypto(format!("argon2 key derivation failed: {e}")))?;
+    Ok(DataKey(out))
 }
 
 pub fn derive_head_object_id(vault: &VaultKey) -> [u8; 32] {

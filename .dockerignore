@@ -1,0 +1,10 @@
+target
+storage
+.git
+.github
+.claude
+.codex
+openspec
+specs
+images
+*.md

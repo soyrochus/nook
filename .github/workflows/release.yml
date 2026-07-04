@@ -1,0 +1,97 @@
+name: Release
+
+# Deliberately tag-only: unlike ci.yml (push/PR), this workflow builds and
+# publishes binaries and must never run on ordinary branch pushes or PRs.
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform_name: linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform_name: windows-x86_64
+          - os: macos-14 # Apple Silicon runner; no Intel macOS target is built.
+            target: aarch64-apple-darwin
+            platform_name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build nook and nookd
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="nook-${{ github.ref_name }}-${{ matrix.platform_name }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/nook" "$stage/"
+          cp "target/${{ matrix.target }}/release/nookd" "$stage/"
+          tar -czf "${stage}.tar.gz" "$stage"
+          shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "nook-${{ github.ref_name }}-${{ matrix.platform_name }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/nook.exe" "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/nookd.exe" "$stage/"
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform_name }}
+          path: |
+            nook-*.tar.gz
+            nook-*.tar.gz.sha256
+            nook-*.zip
+            nook-*.zip.sha256
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

@@ -68,8 +68,7 @@ pub fn encrypt_object(
     plaintext_chunks.push(header_chunk);
 
     if data.is_empty() {
-        let mut buf = Vec::new();
-        buf.resize(DEFAULT_CHUNK_SIZE, 0u8);
+        let buf = vec![0u8; DEFAULT_CHUNK_SIZE];
         plaintext_chunks.push(buf);
     } else {
         for chunk in data.chunks(DEFAULT_CHUNK_SIZE) {
@@ -183,6 +182,18 @@ pub fn decrypt_object(
     }
     if header.protocol_version != PROTOCOL_VERSION {
         return Err(NookError::Crypto("protocol version mismatch".into()));
+    }
+    // The wrapped DEK is present twice on the wire: once inside this
+    // AEAD-encrypted header, and once unencrypted in the outer envelope
+    // (needed to unwrap the DEK before the header itself can be decrypted).
+    // The outer copy is untrusted until checked against the one just
+    // decrypted; a mismatch means the envelope was tampered with or the two
+    // have otherwise diverged, so fail closed rather than silently trusting
+    // either copy.
+    if header.wrapped_dek != wrapped_key.0 {
+        return Err(NookError::Crypto(
+            "wrapped key mismatch between outer envelope and encrypted header".into(),
+        ));
     }
     let chunk_size = header.chunk_size as usize;
     if chunk_size != DEFAULT_CHUNK_SIZE {
