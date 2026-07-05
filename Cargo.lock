@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "nook"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "nook-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "nookd"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
