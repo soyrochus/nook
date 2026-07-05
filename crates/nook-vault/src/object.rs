@@ -207,9 +207,7 @@ pub fn decrypt_object(
             &associated_data(&object_id, idx as u64),
             chunk,
         )?;
-        let remaining = header
-            .logical_size
-            .saturating_sub(data.len() as u64) as usize;
+        let remaining = header.logical_size.saturating_sub(data.len() as u64) as usize;
         if remaining == 0 {
             break;
         }

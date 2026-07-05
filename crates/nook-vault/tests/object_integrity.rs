@@ -1,4 +1,4 @@
-use nook_core::{
+use nook_vault::{
     decrypt_object, deserialize_encrypted_object, encrypt_object, generate_vault_key,
     serialize_encrypted_object, unwrap_data_key, wrap_data_key, EncryptedObject, ObjectType,
 };

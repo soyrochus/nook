@@ -115,7 +115,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/soyrochus/nook"
@@ -257,7 +257,7 @@ Do not change the security model unless existing wording becomes inconsistent du
 Set the package version to:
 
 ```toml
-version = "0.10.0"
+version = "0.11.0"
 ```
 
 or use the workspace version if already configured.

@@ -20,7 +20,10 @@ fn random_hex_id() -> String {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 struct Nookd {
@@ -116,17 +119,27 @@ impl SignedClient {
     }
 
     fn url(&self, namespace_id: &str, object_id: &str) -> String {
-        format!("{}{}", self.base, nook_core::object_path(&self.vault_id, namespace_id, object_id))
+        format!(
+            "{}{}",
+            self.base,
+            nook_vault::object_path(&self.vault_id, namespace_id, object_id)
+        )
     }
 
     fn path(&self, namespace_id: &str, object_id: &str) -> String {
-        nook_core::object_path(&self.vault_id, namespace_id, object_id)
+        nook_vault::object_path(&self.vault_id, namespace_id, object_id)
     }
 
-    fn put(&self, namespace_id: &str, object_id: &str, body: &'static str) -> reqwest::blocking::Response {
+    fn put(
+        &self,
+        namespace_id: &str,
+        object_id: &str,
+        body: &'static str,
+    ) -> reqwest::blocking::Response {
         let timestamp = now_unix();
         let path = self.path(namespace_id, object_id);
-        let sig = nook_core::sign_request(&self.credential, "PUT", &path, timestamp, body.as_bytes());
+        let sig =
+            nook_vault::sign_request(&self.credential, "PUT", &path, timestamp, body.as_bytes());
         self.client
             .put(self.url(namespace_id, object_id))
             .header("X-Nook-Timestamp", timestamp.to_string())
@@ -139,7 +152,7 @@ impl SignedClient {
     fn get(&self, namespace_id: &str, object_id: &str) -> reqwest::blocking::Response {
         let timestamp = now_unix();
         let path = self.path(namespace_id, object_id);
-        let sig = nook_core::sign_request(&self.credential, "GET", &path, timestamp, b"");
+        let sig = nook_vault::sign_request(&self.credential, "GET", &path, timestamp, b"");
         self.client
             .get(self.url(namespace_id, object_id))
             .header("X-Nook-Timestamp", timestamp.to_string())
@@ -149,7 +162,12 @@ impl SignedClient {
     }
 }
 
-fn db_row(db_path: &PathBuf, vault_id: &str, namespace_id: &str, object_id: &str) -> Option<(i64, i64, i64, i64)> {
+fn db_row(
+    db_path: &PathBuf,
+    vault_id: &str,
+    namespace_id: &str,
+    object_id: &str,
+) -> Option<(i64, i64, i64, i64)> {
     let conn = Connection::open(db_path).unwrap();
     conn.query_row(
         "SELECT size, etag, created_at, updated_at FROM objects WHERE vault_id = ?1 AND namespace_id = ?2 AND object_id = ?3",
@@ -184,7 +202,11 @@ fn missing_signature_is_rejected() {
     let http = reqwest::blocking::Client::new();
     let ns = random_hex_id();
     let obj = random_hex_id();
-    let url = format!("http://{}{}", server.addr, nook_core::object_path(&vault_id, &ns, &obj));
+    let url = format!(
+        "http://{}{}",
+        server.addr,
+        nook_vault::object_path(&vault_id, &ns, &obj)
+    );
 
     let res = http.put(&url).body("hello").send().unwrap();
     assert_eq!(res.status(), 401);
@@ -259,14 +281,16 @@ fn timestamps_populate_on_create_and_update() {
     let db_path = tmp.path().join("meta.sqlite");
 
     assert_eq!(client.put(&ns, &obj, "first").status(), 201);
-    let (_, _, created_at, updated_at) = db_row(&db_path, &vault_id, &ns, &obj).expect("row after create");
+    let (_, _, created_at, updated_at) =
+        db_row(&db_path, &vault_id, &ns, &obj).expect("row after create");
     assert!(created_at > 0);
     assert_eq!(created_at, updated_at);
 
     std::thread::sleep(Duration::from_millis(1100));
 
     assert_eq!(client.put(&ns, &obj, "second-longer").status(), 200);
-    let (_, _, created_at2, updated_at2) = db_row(&db_path, &vault_id, &ns, &obj).expect("row after update");
+    let (_, _, created_at2, updated_at2) =
+        db_row(&db_path, &vault_id, &ns, &obj).expect("row after update");
     assert_eq!(created_at2, created_at);
     assert!(updated_at2 > updated_at);
 }
@@ -289,8 +313,14 @@ fn oversized_upload_is_rejected_without_partial_writes() {
     assert_eq!(client.get(&ns, &big_obj).status(), 404);
 
     let temp_dir = tmp.path().join("temp");
-    let leftover: Vec<_> = std::fs::read_dir(&temp_dir).unwrap().map(|e| e.unwrap().path()).collect();
-    assert!(leftover.is_empty(), "temp dir must be clean after a rejected upload: {leftover:?}");
+    let leftover: Vec<_> = std::fs::read_dir(&temp_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "temp dir must be clean after a rejected upload: {leftover:?}"
+    );
 
     assert_eq!(client.get(&ns, &small_obj).status(), 200);
 }
@@ -306,10 +336,18 @@ fn quota_is_independent_per_vault() {
     let ns = random_hex_id();
 
     // Exhaust vault A's tiny quota.
-    assert_eq!(client_a.put(&ns, &random_hex_id(), "1234567890").status(), 201);
+    assert_eq!(
+        client_a.put(&ns, &random_hex_id(), "1234567890").status(),
+        201
+    );
     let over_res = client_a.put(&ns, &random_hex_id(), "one more byte!");
     assert_eq!(over_res.status(), 507);
 
     // Vault B is unaffected.
-    assert_eq!(client_b.put(&ns, &random_hex_id(), "plenty of room here").status(), 201);
+    assert_eq!(
+        client_b
+            .put(&ns, &random_hex_id(), "plenty of room here")
+            .status(),
+        201
+    );
 }

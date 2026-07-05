@@ -44,11 +44,32 @@ One `nookd` server hosts multiple **vaults**: credential-gated storage container
 
 Nook is for pushing and pulling complete encrypted snapshots of directory trees between devices you control, through infrastructure you don't trust.
 
+## Package name
+
+The project is Nook, and the installed commands are still `nook` and `nookd`.
+On crates.io the package is published as `nook-vault` because the `nook`
+package name is already taken by another, currently unmaintained package.
+
 ## Requirements
 
 - Rust (stable) + Cargo
 
-## Build / install
+## Installation
+
+Install from crates.io:
+
+```bash
+cargo install nook-vault
+```
+
+This installs two executables:
+
+```bash
+nook
+nookd
+```
+
+## Build from source
 
 From the repo root:
 
@@ -60,13 +81,6 @@ Binaries will be at:
 
 - `target/release/nook` (CLI client)
 - `target/release/nookd` (server daemon)
-
-Optional install to Cargo bin dir:
-
-```bash
-cargo install --path crates/nook
-cargo install --path crates/nookd
-```
 
 ## Run the server
 
@@ -122,7 +136,7 @@ Other vault management commands:
 ### Run the server in a container (Podman / Docker)
 
 ```bash
-podman build -f crates/nookd/Dockerfile -t nookd .
+podman build -f crates/nook-vault/Dockerfile -t nookd .
 podman volume create nookd-data
 podman run -d --name nookd -p 8080:8080 -v nookd-data:/data nookd
 ```

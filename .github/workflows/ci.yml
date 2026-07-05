@@ -35,4 +35,4 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build nookd container image (build-only, not pushed)
-        run: docker build -f crates/nookd/Dockerfile -t nookd:ci .
+        run: docker build -f crates/nook-vault/Dockerfile -t nookd:ci .

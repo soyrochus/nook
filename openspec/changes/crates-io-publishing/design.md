@@ -33,7 +33,7 @@ The repository is currently a Rust workspace with separate `nook-core`, `nook`, 
 
 3. Keep versioning in workspace metadata.
 
-   The root workspace already defines version `0.10.0` and edition `2021`. The publishable package should inherit these values unless existing metadata requires a more specific package-level value. Additional publish metadata such as license, repository, description, readme, keywords, and categories should be added from existing project files and not conflict with repository reality.
+   The root workspace already defines version `0.11.0` and edition `2021`. The publishable package should inherit these values unless existing metadata requires a more specific package-level value. Additional publish metadata such as license, repository, description, readme, keywords, and categories should be added from existing project files and not conflict with repository reality.
 
 4. Treat documentation and validation as part of the package contract.
 

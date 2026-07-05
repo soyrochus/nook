@@ -36,13 +36,25 @@ fn canonical_string(method: &str, path: &str, timestamp: i64, body_hash: &[u8]) 
 /// Computes the hex-encoded HMAC-SHA256 signature for a request, given the
 /// full body available in memory (the common case for the client, which
 /// already reads whole files into memory before encrypting them).
-pub fn sign_request(credential: &[u8], method: &str, path: &str, timestamp: i64, body: &[u8]) -> String {
+pub fn sign_request(
+    credential: &[u8],
+    method: &str,
+    path: &str,
+    timestamp: i64,
+    body: &[u8],
+) -> String {
     sign_with_body_hash(credential, method, path, timestamp, &body_sha256(body))
 }
 
 /// Same as [`sign_request`], but takes an already-computed body digest —
 /// for signing/verifying a streamed body without buffering it.
-pub fn sign_with_body_hash(credential: &[u8], method: &str, path: &str, timestamp: i64, body_hash: &[u8]) -> String {
+pub fn sign_with_body_hash(
+    credential: &[u8],
+    method: &str,
+    path: &str,
+    timestamp: i64,
+    body_hash: &[u8],
+) -> String {
     let mut mac = HmacSha256::new_from_slice(credential).expect("HMAC accepts a key of any length");
     mac.update(canonical_string(method, path, timestamp, body_hash).as_bytes());
     hex::encode(mac.finalize().into_bytes())
@@ -58,7 +70,14 @@ pub fn verify_request(
     body: &[u8],
     signature_hex: &str,
 ) -> bool {
-    verify_with_body_hash(credential, method, path, timestamp, &body_sha256(body), signature_hex)
+    verify_with_body_hash(
+        credential,
+        method,
+        path,
+        timestamp,
+        &body_sha256(body),
+        signature_hex,
+    )
 }
 
 /// Same as [`verify_request`], but takes an already-computed body digest —
@@ -84,5 +103,8 @@ pub fn verify_with_body_hash(
 /// validate all three path segments identically before they ever touch a
 /// filesystem path or SQL query.
 pub fn is_valid_hex_id(id: &str) -> bool {
-    id.len() == 64 && id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    id.len() == 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }

@@ -31,7 +31,12 @@ use tracing_subscriber::EnvFilter;
 const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
 
 #[derive(Parser)]
-#[command(author, version, about = "nookd — encrypted push/pull vault server")]
+#[command(
+    name = "nookd",
+    author,
+    version,
+    about = "nookd — encrypted push/pull vault server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -127,7 +132,11 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_server(listen: String, storage: PathBuf, default_quota_bytes: Option<u64>) -> Result<()> {
+async fn run_server(
+    listen: String,
+    storage: PathBuf,
+    default_quota_bytes: Option<u64>,
+) -> Result<()> {
     let objects_dir = storage.join("objects");
     let temp_dir = storage.join("temp");
     let db_path = storage.join("meta.sqlite");
@@ -149,7 +158,10 @@ async fn run_server(listen: String, storage: PathBuf, default_quota_bytes: Optio
     let app = Router::new()
         .route(
             "/v1/vault/:vault_id/ns/:namespace_id/obj/:object_id",
-            get(handle_get).put(handle_put).head(handle_head).delete(handle_delete),
+            get(handle_get)
+                .put(handle_put)
+                .head(handle_head)
+                .delete(handle_delete),
         )
         .route(
             "/v1/vault/:vault_id/ns/:namespace_id/objects",
@@ -170,7 +182,10 @@ async fn run_server(listen: String, storage: PathBuf, default_quota_bytes: Optio
 /// for safe concurrent access rather than any in-process coordination.
 fn run_vault_command(action: VaultCommand) -> Result<()> {
     match action {
-        VaultCommand::Create { quota_bytes, storage } => {
+        VaultCommand::Create {
+            quota_bytes,
+            storage,
+        } => {
             let db_path = ensure_storage(&storage)?;
             let mut vault_id = [0u8; 32];
             OsRng.fill_bytes(&mut vault_id);
@@ -223,7 +238,9 @@ fn run_vault_command(action: VaultCommand) -> Result<()> {
                     "{:<64}  {:<12}  {:<12}  {:<12}  {:<8}  {}",
                     vault_id,
                     created_at,
-                    quota_bytes.map(|q| q.to_string()).unwrap_or_else(|| "unlimited".to_string()),
+                    quota_bytes
+                        .map(|q| q.to_string())
+                        .unwrap_or_else(|| "unlimited".to_string()),
                     bytes_used,
                     revoked,
                     ns_count
@@ -233,11 +250,14 @@ fn run_vault_command(action: VaultCommand) -> Result<()> {
         }
         VaultCommand::Revoke { vault_id, storage } => {
             let db_path = ensure_storage(&storage)?;
-            if !nook_core::is_valid_hex_id(&vault_id) {
+            if !nook_vault::is_valid_hex_id(&vault_id) {
                 return Err(anyhow::anyhow!("invalid vault_id"));
             }
             let conn = Connection::open(&db_path)?;
-            let updated = conn.execute("UPDATE vaults SET revoked = 1 WHERE vault_id = ?1", [&vault_id])?;
+            let updated = conn.execute(
+                "UPDATE vaults SET revoked = 1 WHERE vault_id = ?1",
+                [&vault_id],
+            )?;
             if updated == 0 {
                 return Err(anyhow::anyhow!("no such vault: {vault_id}"));
             }
@@ -263,7 +283,7 @@ async fn handle_head(
     if !valid_path_ids(&vault_id, &namespace_id, &object_id) {
         return (StatusCode::BAD_REQUEST, "invalid id").into_response();
     }
-    let path = nook_core::object_path(&vault_id, &namespace_id, &object_id);
+    let path = nook_vault::object_path(&vault_id, &namespace_id, &object_id);
     if let Some(resp) = authenticate(&state, "HEAD", &path, &headers, &[]).await {
         return resp;
     }
@@ -290,15 +310,21 @@ async fn handle_get(
     if !valid_path_ids(&vault_id, &namespace_id, &object_id) {
         return (StatusCode::BAD_REQUEST, "invalid id").into_response();
     }
-    let path = nook_core::object_path(&vault_id, &namespace_id, &object_id);
+    let path = nook_vault::object_path(&vault_id, &namespace_id, &object_id);
     if let Some(resp) = authenticate(&state, "GET", &path, &headers, &[]).await {
         return resp;
     }
 
-    let object_path = state.objects_dir.join(&vault_id).join(&namespace_id).join(&object_id);
+    let object_path = state
+        .objects_dir
+        .join(&vault_id)
+        .join(&namespace_id)
+        .join(&object_id);
     let file = match fs::File::open(&object_path).await {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response()
+        }
         Err(e) => {
             error!("open error: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -307,8 +333,12 @@ async fn handle_get(
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
     let mut resp = Response::builder().status(StatusCode::OK);
-    if let Ok(Some(meta)) = load_meta(state.db_path.clone(), vault_id, namespace_id, object_id).await {
-        resp = resp.header(ETAG, meta.etag.to_string()).header(CONTENT_LENGTH, meta.size.to_string());
+    if let Ok(Some(meta)) =
+        load_meta(state.db_path.clone(), vault_id, namespace_id, object_id).await
+    {
+        resp = resp
+            .header(ETAG, meta.etag.to_string())
+            .header(CONTENT_LENGTH, meta.size.to_string());
     }
     resp.body(body).unwrap()
 }
@@ -334,7 +364,10 @@ async fn handle_put(
         }
     };
 
-    let if_match = headers.get(IF_MATCH).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let if_match = headers
+        .get(IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let namespace_dir = state.objects_dir.join(&vault_id).join(&namespace_id);
     if let Err(err) = fs::create_dir_all(&namespace_dir).await {
@@ -380,14 +413,17 @@ async fn handle_put(
     }
     let body_hash = hasher.finalize().to_vec();
 
-    let path = nook_core::object_path(&vault_id, &namespace_id, &object_id);
+    let path = nook_vault::object_path(&vault_id, &namespace_id, &object_id);
     if let Some(resp) = verify_signature(&vault.credential, "PUT", &path, &headers, &body_hash) {
         let _ = fs::remove_file(&temp_path).await;
         return resp;
     }
 
     let dest = namespace_dir.join(&object_id);
-    let quota = vault.quota_bytes.map(|q| q as u64).or(state.default_quota_bytes);
+    let quota = vault
+        .quota_bytes
+        .map(|q| q as u64)
+        .or(state.default_quota_bytes);
 
     let outcome = task::spawn_blocking({
         let db_path = state.db_path.clone();
@@ -426,7 +462,11 @@ async fn handle_put(
 
     match outcome {
         PutOutcome::Committed { etag, created } => Response::builder()
-            .status(if created { StatusCode::CREATED } else { StatusCode::OK })
+            .status(if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            })
             .header(ETAG, etag.to_string())
             .body(Body::empty())
             .unwrap(),
@@ -445,12 +485,16 @@ async fn handle_delete(
     if !valid_path_ids(&vault_id, &namespace_id, &object_id) {
         return (StatusCode::BAD_REQUEST, "invalid id").into_response();
     }
-    let path = nook_core::object_path(&vault_id, &namespace_id, &object_id);
+    let path = nook_vault::object_path(&vault_id, &namespace_id, &object_id);
     if let Some(resp) = authenticate(&state, "DELETE", &path, &headers, &[]).await {
         return resp;
     }
 
-    let object_path = state.objects_dir.join(&vault_id).join(&namespace_id).join(&object_id);
+    let object_path = state
+        .objects_dir
+        .join(&vault_id)
+        .join(&namespace_id)
+        .join(&object_id);
     let outcome = task::spawn_blocking({
         let db_path = state.db_path.clone();
         move || commit_delete(&db_path, &vault_id, &namespace_id, &object_id)
@@ -481,7 +525,12 @@ async fn handle_delete(
 
 /// Deletes the object's metadata row and releases its quota in one
 /// transaction. Returns `false` (no metadata touched) if the row is absent.
-fn commit_delete(db_path: &FsPath, vault_id: &str, namespace_id: &str, object_id: &str) -> Result<bool> {
+fn commit_delete(
+    db_path: &FsPath,
+    vault_id: &str,
+    namespace_id: &str,
+    object_id: &str,
+) -> Result<bool> {
     let mut conn = Connection::open(db_path)?;
     let tx = conn.transaction()?;
 
@@ -518,10 +567,10 @@ async fn handle_list(
     Path((vault_id, namespace_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !nook_core::is_valid_hex_id(&vault_id) || !nook_core::is_valid_hex_id(&namespace_id) {
+    if !nook_vault::is_valid_hex_id(&vault_id) || !nook_vault::is_valid_hex_id(&namespace_id) {
         return (StatusCode::BAD_REQUEST, "invalid id").into_response();
     }
-    let path = nook_core::namespace_objects_path(&vault_id, &namespace_id);
+    let path = nook_vault::namespace_objects_path(&vault_id, &namespace_id);
     if let Some(resp) = authenticate(&state, "GET", &path, &headers, &[]).await {
         return resp;
     }
@@ -572,7 +621,9 @@ async fn handle_list(
 }
 
 fn valid_path_ids(vault_id: &str, namespace_id: &str, object_id: &str) -> bool {
-    nook_core::is_valid_hex_id(vault_id) && nook_core::is_valid_hex_id(namespace_id) && nook_core::is_valid_hex_id(object_id)
+    nook_vault::is_valid_hex_id(vault_id)
+        && nook_vault::is_valid_hex_id(namespace_id)
+        && nook_vault::is_valid_hex_id(object_id)
 }
 
 fn unauthorized() -> Response {
@@ -583,7 +634,13 @@ fn unauthorized() -> Response {
 /// credential) and verifies the signature, in one step since neither has a
 /// body to stream first. Returns `Some(response)` to short-circuit with,
 /// or `None` if authentication succeeded.
-async fn authenticate(state: &AppState, method: &str, path: &str, headers: &HeaderMap, body: &[u8]) -> Option<Response> {
+async fn authenticate(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<Response> {
     let vault_id = extract_vault_id_from_path(path);
     let vault = match load_vault(state.db_path.clone(), vault_id).await {
         Ok(Some(v)) if !v.revoked => v,
@@ -593,7 +650,13 @@ async fn authenticate(state: &AppState, method: &str, path: &str, headers: &Head
             return Some(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
-    verify_signature(&vault.credential, method, path, headers, &nook_core::body_sha256(body))
+    verify_signature(
+        &vault.credential,
+        method,
+        path,
+        headers,
+        &nook_vault::body_sha256(body),
+    )
 }
 
 fn extract_vault_id_from_path(path: &str) -> String {
@@ -602,16 +665,24 @@ fn extract_vault_id_from_path(path: &str) -> String {
 }
 
 /// `body_hash` must already be the SHA-256 digest of the request body (see
-/// `nook_core::body_sha256`/streaming equivalent) — never the raw body — so
+/// `nook_vault::body_sha256`/streaming equivalent) — never the raw body — so
 /// callers with a streamed body never need to buffer it to authenticate.
 /// Returns `Some(response)` to short-circuit with, or `None` if the
 /// signature is valid.
-fn verify_signature(credential: &[u8], method: &str, path: &str, headers: &HeaderMap, body_hash: &[u8]) -> Option<Response> {
+fn verify_signature(
+    credential: &[u8],
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body_hash: &[u8],
+) -> Option<Response> {
     let timestamp = headers
         .get("X-Nook-Timestamp")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i64>().ok());
-    let signature = headers.get("X-Nook-Signature").and_then(|v| v.to_str().ok());
+    let signature = headers
+        .get("X-Nook-Signature")
+        .and_then(|v| v.to_str().ok());
 
     let (Some(timestamp), Some(signature)) = (timestamp, signature) else {
         return Some(unauthorized());
@@ -619,7 +690,8 @@ fn verify_signature(credential: &[u8], method: &str, path: &str, headers: &Heade
     if (now_unix() - timestamp).abs() > MAX_TIMESTAMP_SKEW_SECS {
         return Some(unauthorized());
     }
-    if !nook_core::verify_with_body_hash(credential, method, path, timestamp, body_hash, signature) {
+    if !nook_vault::verify_with_body_hash(credential, method, path, timestamp, body_hash, signature)
+    {
         return Some(unauthorized());
     }
     None
@@ -669,8 +741,14 @@ fn commit_put(
 
     let old_size = existing.map(|(s, _)| s as u64).unwrap_or(0);
     if let Some(quota) = quota {
-        let bytes_used: i64 = tx.query_row("SELECT bytes_used FROM vaults WHERE vault_id = ?1", [vault_id], |row| row.get(0))?;
-        let projected = (bytes_used as u64).saturating_sub(old_size).saturating_add(size);
+        let bytes_used: i64 = tx.query_row(
+            "SELECT bytes_used FROM vaults WHERE vault_id = ?1",
+            [vault_id],
+            |row| row.get(0),
+        )?;
+        let projected = (bytes_used as u64)
+            .saturating_sub(old_size)
+            .saturating_add(size);
         if projected > quota {
             let _ = std::fs::remove_file(temp_path);
             return Ok(PutOutcome::QuotaExceeded);
@@ -685,7 +763,14 @@ fn commit_put(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
          ON CONFLICT(vault_id, namespace_id, object_id)
          DO UPDATE SET size=excluded.size, etag=excluded.etag, updated_at=excluded.updated_at",
-        (vault_id, namespace_id, object_id, size as i64, new_etag, now),
+        (
+            vault_id,
+            namespace_id,
+            object_id,
+            size as i64,
+            new_etag,
+            now,
+        ),
     )?;
 
     let delta = size as i64 - old_size as i64;
@@ -701,7 +786,12 @@ fn commit_put(
     })
 }
 
-async fn load_meta(db_path: PathBuf, vault_id: String, namespace_id: String, object_id: String) -> Result<Option<ObjectMeta>> {
+async fn load_meta(
+    db_path: PathBuf,
+    vault_id: String,
+    namespace_id: String,
+    object_id: String,
+) -> Result<Option<ObjectMeta>> {
     task::spawn_blocking(move || -> Result<Option<ObjectMeta>> {
         let conn = Connection::open(db_path)?;
         conn.query_row(

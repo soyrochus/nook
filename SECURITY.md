@@ -5,6 +5,9 @@ the security guarantees described in detail in
 [`specs/SPEC-001-Base Implementation.md`](specs/SPEC-001-Base%20Implementation.md)
 §19, for readers who want the short version without reading the full spec.
 
+Naming note: the product is Nook, the crates.io package is `nook-vault`, and
+the installed executables are `nook` for the client and `nookd` for the server.
+
 ## Threat model
 
 Nook is designed to behave correctly even in fully untrusted network and

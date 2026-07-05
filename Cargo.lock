@@ -1340,77 +1340,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "nook"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "clap",
- "directories",
- "futures",
- "hex",
- "hmac",
- "keyring",
- "nook-core",
- "rand 0.8.5",
- "reqwest",
- "rpassword",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
- "toml",
- "walkdir",
-]
-
-[[package]]
-name = "nook-core"
+name = "nook-vault"
 version = "0.11.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "axum",
+ "base64",
  "bincode",
+ "bytes",
  "chacha20poly1305",
+ "clap",
+ "directories",
+ "futures",
+ "futures-util",
  "hex",
  "hkdf",
  "hmac",
+ "hyper",
+ "keyring",
  "rand 0.8.5",
  "rand_core 0.6.4",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 1.0.69",
- "zeroize",
-]
-
-[[package]]
-name = "nookd"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "clap",
- "futures-util",
- "hex",
- "hmac",
- "hyper",
- "nook-core",
- "rand 0.8.5",
  "reqwest",
+ "rpassword",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "toml",
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
+ "zeroize",
 ]
 
 [[package]]

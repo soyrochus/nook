@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
-use nook_core::{
-    decrypt_object, derive_head_object_id, encrypt_object, serialize_encrypted_object, Manifest, Node,
-    NodeType, ObjectType, VaultKey, WrappedKey,
+use nook_vault::{
+    decrypt_object, derive_head_object_id, encrypt_object, serialize_encrypted_object, Manifest,
+    Node, NodeType, ObjectType, VaultKey, WrappedKey,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -51,7 +51,12 @@ const NAMESPACE_BUNDLE_PREFIX: &str = "nookns1";
 const SECRETS_LEN: usize = 64;
 
 #[derive(Parser)]
-#[command(author, version, about = "Nook CLI — encrypted push/pull vault")]
+#[command(
+    name = "nook",
+    author,
+    version,
+    about = "Nook CLI — encrypted push/pull vault"
+)]
 struct Cli {
     #[arg(long, global = true)]
     server: Option<String>,
@@ -178,7 +183,9 @@ mod base64_vec {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+        BASE64
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -199,7 +206,9 @@ mod base64_array24 {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        let decoded = BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom)?;
+        let decoded = BASE64
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)?;
         let mut out = [0u8; 24];
         if decoded.len() != 24 {
             return Err(serde::de::Error::custom("expected 24-byte nonce"));
@@ -283,13 +292,13 @@ fn load_client_identity(cfg: &Config) -> Result<(VaultKey, ClientAuth)> {
 }
 
 fn encrypt_secrets_with_passphrase(secrets: &[u8], passphrase: &str) -> Result<KeyStorage> {
-    let mut salt = [0u8; nook_core::PASSPHRASE_SALT_LEN];
+    let mut salt = [0u8; nook_vault::PASSPHRASE_SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
-    let wrap_key = nook_core::derive_passphrase_key(passphrase.as_bytes(), &salt)
+    let wrap_key = nook_vault::derive_passphrase_key(passphrase.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("deriving passphrase key: {e}"))?;
-    let ciphertext = nook_core::encrypt_chunk(&wrap_key, &nonce, LOCAL_KEY_AAD, secrets);
+    let ciphertext = nook_vault::encrypt_chunk(&wrap_key, &nonce, LOCAL_KEY_AAD, secrets);
     Ok(KeyStorage::EncryptedFile {
         salt: salt.to_vec(),
         nonce,
@@ -303,9 +312,9 @@ fn decrypt_secrets_with_passphrase(
     ciphertext: &[u8],
     passphrase: &str,
 ) -> Result<Vec<u8>> {
-    let wrap_key = nook_core::derive_passphrase_key(passphrase.as_bytes(), salt)
+    let wrap_key = nook_vault::derive_passphrase_key(passphrase.as_bytes(), salt)
         .map_err(|e| anyhow::anyhow!("deriving passphrase key: {e}"))?;
-    nook_core::decrypt_chunk(&wrap_key, nonce, LOCAL_KEY_AAD, ciphertext)
+    nook_vault::decrypt_chunk(&wrap_key, nonce, LOCAL_KEY_AAD, ciphertext)
         .map_err(|_| anyhow::anyhow!("incorrect passphrase or corrupted local key file"))
 }
 
@@ -321,8 +330,8 @@ fn read_new_passphrase() -> Result<String> {
     if first.is_empty() {
         return Err(anyhow::anyhow!("passphrase must not be empty"));
     }
-    let confirm =
-        rpassword::prompt_password("Confirm passphrase: ").context("reading passphrase confirmation")?;
+    let confirm = rpassword::prompt_password("Confirm passphrase: ")
+        .context("reading passphrase confirmation")?;
     if first != confirm {
         return Err(anyhow::anyhow!("passphrases did not match"));
     }
@@ -370,12 +379,17 @@ async fn cmd_init(
     vault_credential: String,
     import_namespace: Option<String>,
 ) -> Result<()> {
-    if !nook_core::is_valid_hex_id(&vault_id) {
-        return Err(anyhow::anyhow!("--vault-id must be 64 lowercase hex characters"));
+    if !nook_vault::is_valid_hex_id(&vault_id) {
+        return Err(anyhow::anyhow!(
+            "--vault-id must be 64 lowercase hex characters"
+        ));
     }
-    let vault_credential_bytes = hex::decode(&vault_credential).context("--vault-credential must be hex-encoded")?;
+    let vault_credential_bytes =
+        hex::decode(&vault_credential).context("--vault-credential must be hex-encoded")?;
     if vault_credential_bytes.len() != 32 {
-        return Err(anyhow::anyhow!("--vault-credential must decode to 32 bytes"));
+        return Err(anyhow::anyhow!(
+            "--vault-credential must decode to 32 bytes"
+        ));
     }
 
     let (namespace_id, namespace_key) = match import_namespace {
@@ -383,7 +397,10 @@ async fn cmd_init(
         None => {
             let mut namespace_id_bytes = [0u8; 32];
             OsRng.fill_bytes(&mut namespace_id_bytes);
-            (hex::encode(namespace_id_bytes), nook_core::generate_vault_key().0)
+            (
+                hex::encode(namespace_id_bytes),
+                nook_vault::generate_vault_key().0,
+            )
         }
     };
 
@@ -408,14 +425,20 @@ async fn cmd_init(
 async fn cmd_namespace_export() -> Result<()> {
     let cfg = load_config().context("nook not initialized; run `nook init`")?;
     let (vault_key, auth) = load_client_identity(&cfg)?;
-    println!("{}", encode_namespace_bundle(&auth.namespace_id, vault_key.as_bytes()));
+    println!(
+        "{}",
+        encode_namespace_bundle(&auth.namespace_id, vault_key.as_bytes())
+    );
     Ok(())
 }
 
 fn encode_namespace_bundle(namespace_id: &str, namespace_key: &[u8; 32]) -> String {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
-    format!("{NAMESPACE_BUNDLE_PREFIX}:{namespace_id}:{}", BASE64.encode(namespace_key))
+    format!(
+        "{NAMESPACE_BUNDLE_PREFIX}:{namespace_id}:{}",
+        BASE64.encode(namespace_key)
+    )
 }
 
 fn decode_namespace_bundle(bundle: &str) -> Result<(String, [u8; 32])> {
@@ -426,14 +449,24 @@ fn decode_namespace_bundle(bundle: &str) -> Result<(String, [u8; 32])> {
     if prefix != NAMESPACE_BUNDLE_PREFIX {
         return Err(anyhow::anyhow!("unrecognized namespace bundle format"));
     }
-    let namespace_id = parts.next().context("malformed namespace bundle: missing namespace_id")?;
-    if !nook_core::is_valid_hex_id(namespace_id) {
-        return Err(anyhow::anyhow!("malformed namespace bundle: invalid namespace_id"));
+    let namespace_id = parts
+        .next()
+        .context("malformed namespace bundle: missing namespace_id")?;
+    if !nook_vault::is_valid_hex_id(namespace_id) {
+        return Err(anyhow::anyhow!(
+            "malformed namespace bundle: invalid namespace_id"
+        ));
     }
-    let key_b64 = parts.next().context("malformed namespace bundle: missing key")?;
-    let key_bytes = BASE64.decode(key_b64).context("malformed namespace bundle: invalid key encoding")?;
+    let key_b64 = parts
+        .next()
+        .context("malformed namespace bundle: missing key")?;
+    let key_bytes = BASE64
+        .decode(key_b64)
+        .context("malformed namespace bundle: invalid key encoding")?;
     if key_bytes.len() != 32 {
-        return Err(anyhow::anyhow!("malformed namespace bundle: key must be 32 bytes"));
+        return Err(anyhow::anyhow!(
+            "malformed namespace bundle: key must be 32 bytes"
+        ));
     }
     let mut namespace_key = [0u8; 32];
     namespace_key.copy_from_slice(&key_bytes);
@@ -490,7 +523,9 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
     // Try to fetch existing manifest, or create empty one
     let head_id = derive_head_object_id(&vault_key);
     let head_hex = hex::encode(head_id);
-    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &auth, &vault_key).await {
+    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &auth, &vault_key)
+        .await
+    {
         Ok((m, e)) => (m, e),
         Err(ManifestFetchError::NotFound) => {
             // No existing manifest, create a new one with root directory
@@ -538,10 +573,9 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
     let mut uploads: Vec<([u8; 32], Vec<u8>)> = Vec::new();
 
     // Check if base_path is a file or directory
-    let base_metadata = tokio_fs::metadata(&base_path).await.context(format!(
-        "cannot access {}",
-        base_path.display()
-    ))?;
+    let base_metadata = tokio_fs::metadata(&base_path)
+        .await
+        .context(format!("cannot access {}", base_path.display()))?;
 
     if base_metadata.is_file() {
         // Pushing a single file
@@ -553,22 +587,26 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         let parent_path = base_path.parent().unwrap_or(&root).to_path_buf();
 
         // Ensure parent directory exists in manifest
-        let parent_id = ensure_path_exists(&mut manifest, &mut next_node_id, &root, &parent_path, &mut path_to_node)?;
+        let parent_id = ensure_path_exists(
+            &mut manifest,
+            &mut next_node_id,
+            &root,
+            &parent_path,
+            &mut path_to_node,
+        )?;
 
         // Check if file already exists
-        let existing_idx = manifest.nodes.iter().position(|n| {
-            n.parent_id == Some(parent_id) && n.name == file_name
-        });
+        let existing_idx = manifest
+            .nodes
+            .iter()
+            .position(|n| n.parent_id == Some(parent_id) && n.name == file_name);
 
         // Create encrypted content
         let mut object_id = [0u8; 32];
         OsRng.fill_bytes(&mut object_id);
         let data = tokio_fs::read(&base_path).await?;
-        let encrypted =
-            encrypt_object(object_id, ObjectType::Content, &data, &vault_key).context(format!(
-                "encrypting {}",
-                base_path.display()
-            ))?;
+        let encrypted = encrypt_object(object_id, ObjectType::Content, &data, &vault_key)
+            .context(format!("encrypting {}", base_path.display()))?;
         let serialized = serialize_encrypted_object(&encrypted)?;
         uploads.push((object_id, serialized));
 
@@ -609,25 +647,35 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
 
             if entry.file_type().is_dir() {
                 // Ensure directory exists in manifest
-                ensure_path_exists(&mut manifest, &mut next_node_id, &root, &path, &mut path_to_node)?;
+                ensure_path_exists(
+                    &mut manifest,
+                    &mut next_node_id,
+                    &root,
+                    &path,
+                    &mut path_to_node,
+                )?;
             } else if entry.file_type().is_file() {
                 let parent_path = path.parent().unwrap_or(&root).to_path_buf();
-                let parent_id = ensure_path_exists(&mut manifest, &mut next_node_id, &root, &parent_path, &mut path_to_node)?;
+                let parent_id = ensure_path_exists(
+                    &mut manifest,
+                    &mut next_node_id,
+                    &root,
+                    &parent_path,
+                    &mut path_to_node,
+                )?;
 
                 // Check if file already exists
-                let existing_idx = manifest.nodes.iter().position(|n| {
-                    n.parent_id == Some(parent_id) && n.name == name
-                });
+                let existing_idx = manifest
+                    .nodes
+                    .iter()
+                    .position(|n| n.parent_id == Some(parent_id) && n.name == name);
 
                 // Create encrypted content
                 let mut object_id = [0u8; 32];
                 OsRng.fill_bytes(&mut object_id);
                 let data = tokio_fs::read(&path).await?;
-                let encrypted =
-                    encrypt_object(object_id, ObjectType::Content, &data, &vault_key).context(format!(
-                        "encrypting {}",
-                        path.display()
-                    ))?;
+                let encrypted = encrypt_object(object_id, ObjectType::Content, &data, &vault_key)
+                    .context(format!("encrypting {}", path.display()))?;
                 let serialized = serialize_encrypted_object(&encrypted)?;
                 uploads.push((object_id, serialized));
 
@@ -665,14 +713,30 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         let hex_id = hex::encode(object_id);
         put_object(&client, &server, &auth, &hex_id, bytes, None).await?;
     }
-    put_object(&client, &server, &auth, &head_hex, manifest_serialized, etag.as_deref()).await?;
+    put_object(
+        &client,
+        &server,
+        &auth,
+        &head_hex,
+        manifest_serialized,
+        etag.as_deref(),
+    )
+    .await?;
 
     println!("Push complete.");
 
     // Post-commit only: a failed CAS swap has already returned above, so a
     // client that lost the race never deletes anything.
     let new_live = manifest_live_set(&manifest, &head_hex);
-    sweep_namespace(&client, &server, &auth, &previous_live, &new_live, gc_grace_seconds(&cfg)).await;
+    sweep_namespace(
+        &client,
+        &server,
+        &auth,
+        &previous_live,
+        &new_live,
+        gc_grace_seconds(&cfg),
+    )
+    .await;
     Ok(())
 }
 
@@ -687,10 +751,14 @@ async fn cmd_rm(server_override: Option<String>, subpath: PathBuf) -> Result<()>
     let head_id = derive_head_object_id(&vault_key);
     let head_hex = hex::encode(head_id);
 
-    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &auth, &vault_key).await {
+    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &auth, &vault_key)
+        .await
+    {
         Ok((m, e)) => (m, e),
         Err(ManifestFetchError::NotFound) => {
-            return Err(anyhow::anyhow!("namespace has no manifest yet; nothing to remove"));
+            return Err(anyhow::anyhow!(
+                "namespace has no manifest yet; nothing to remove"
+            ));
         }
         Err(ManifestFetchError::Other(e)) => {
             return Err(e.context(
@@ -712,14 +780,31 @@ async fn cmd_rm(server_override: Option<String>, subpath: PathBuf) -> Result<()>
 
     manifest.integrity_checksum = manifest.compute_integrity()?;
     let manifest_bytes = serde_json::to_vec(&manifest)?;
-    let manifest_object = encrypt_object(head_id, ObjectType::Manifest, &manifest_bytes, &vault_key)?;
+    let manifest_object =
+        encrypt_object(head_id, ObjectType::Manifest, &manifest_bytes, &vault_key)?;
     let manifest_serialized = serialize_encrypted_object(&manifest_object)?;
-    put_object(&client, &server, &auth, &head_hex, manifest_serialized, etag.as_deref()).await?;
+    put_object(
+        &client,
+        &server,
+        &auth,
+        &head_hex,
+        manifest_serialized,
+        etag.as_deref(),
+    )
+    .await?;
 
     println!("Removed {}.", subpath.display());
 
     let new_live = manifest_live_set(&manifest, &head_hex);
-    sweep_namespace(&client, &server, &auth, &previous_live, &new_live, gc_grace_seconds(&cfg)).await;
+    sweep_namespace(
+        &client,
+        &server,
+        &auth,
+        &previous_live,
+        &new_live,
+        gc_grace_seconds(&cfg),
+    )
+    .await;
     Ok(())
 }
 
@@ -829,21 +914,35 @@ struct NamespaceListing {
     objects: Vec<ListedObject>,
 }
 
-async fn list_namespace_objects(client: &Client, server: &str, auth: &ClientAuth) -> Result<NamespaceListing> {
-    let path = nook_core::namespace_objects_path(&auth.vault_id, &auth.namespace_id);
+async fn list_namespace_objects(
+    client: &Client,
+    server: &str,
+    auth: &ClientAuth,
+) -> Result<NamespaceListing> {
+    let path = nook_vault::namespace_objects_path(&auth.vault_id, &auth.namespace_id);
     let url = format!("{server}{path}");
     let headers = signed_headers(auth, "GET", &path, b"")?;
     let res = client.get(url).headers(headers).send().await?;
     if !res.status().is_success() {
-        return Err(anyhow::anyhow!("listing failed with status {}", res.status()));
+        return Err(anyhow::anyhow!(
+            "listing failed with status {}",
+            res.status()
+        ));
     }
-    res.json::<NamespaceListing>().await.context("parsing namespace listing")
+    res.json::<NamespaceListing>()
+        .await
+        .context("parsing namespace listing")
 }
 
 /// Deletes one object. A 404 counts as success (another client already swept
 /// it); a 405 means the server predates SPEC-005 deletion support.
-async fn delete_object(client: &Client, server: &str, auth: &ClientAuth, object_id_hex: &str) -> Result<()> {
-    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+async fn delete_object(
+    client: &Client,
+    server: &str,
+    auth: &ClientAuth,
+    object_id_hex: &str,
+) -> Result<()> {
+    let path = nook_vault::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
     let url = format!("{server}{path}");
     let headers = signed_headers(auth, "DELETE", &path, b"")?;
     let res = client.delete(url).headers(headers).send().await?;
@@ -958,7 +1057,7 @@ async fn fetch_manifest_with_etag(
     let head_id = derive_head_object_id(vault_key);
     let head_hex = hex::encode(head_id);
 
-    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, &head_hex);
+    let path = nook_vault::object_path(&auth.vault_id, &auth.namespace_id, &head_hex);
     let url = format!("{server}{path}");
     let headers = signed_headers(auth, "GET", &path, b"")
         .map_err(|e| ManifestFetchError::Other(e.context("signing manifest request")))?;
@@ -967,7 +1066,9 @@ async fn fetch_manifest_with_etag(
         .headers(headers)
         .send()
         .await
-        .map_err(|e| ManifestFetchError::Other(anyhow::Error::new(e).context("requesting manifest")))?;
+        .map_err(|e| {
+            ManifestFetchError::Other(anyhow::Error::new(e).context("requesting manifest"))
+        })?;
 
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(ManifestFetchError::NotFound);
@@ -988,18 +1089,22 @@ async fn fetch_manifest_with_etag(
     let manifest_bytes = res
         .bytes()
         .await
-        .map_err(|e| ManifestFetchError::Other(anyhow::Error::new(e).context("reading manifest body")))?
+        .map_err(|e| {
+            ManifestFetchError::Other(anyhow::Error::new(e).context("reading manifest body"))
+        })?
         .to_vec();
-    let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes).map_err(|e| {
-        ManifestFetchError::Other(anyhow::anyhow!("deserializing manifest envelope: {e}"))
-    })?;
+    let (wrapped, chunks) =
+        nook_vault::deserialize_encrypted_object(&manifest_bytes).map_err(|e| {
+            ManifestFetchError::Other(anyhow::anyhow!("deserializing manifest envelope: {e}"))
+        })?;
     let decrypted = decrypt_object(head_id, &wrapped, &chunks, vault_key)
         .map_err(|e| ManifestFetchError::Other(anyhow::anyhow!("decrypting manifest: {e}")))?;
-    let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext)
-        .map_err(|e| ManifestFetchError::Other(anyhow::Error::new(e).context("parsing manifest JSON")))?;
-    manifest
-        .validate_integrity()
-        .map_err(|e| ManifestFetchError::Other(anyhow::anyhow!("manifest integrity check failed: {e}")))?;
+    let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext).map_err(|e| {
+        ManifestFetchError::Other(anyhow::Error::new(e).context("parsing manifest JSON"))
+    })?;
+    manifest.validate_integrity().map_err(|e| {
+        ManifestFetchError::Other(anyhow::anyhow!("manifest integrity check failed: {e}"))
+    })?;
 
     Ok((manifest, etag))
 }
@@ -1026,10 +1131,7 @@ async fn cmd_ls(server_override: Option<String>, subpath: Option<PathBuf>) -> Re
             print_entry(target);
         }
         NodeType::Directory => {
-            let mut children = children_by_id
-                .get(&target_id)
-                .cloned()
-                .unwrap_or_default();
+            let mut children = children_by_id.get(&target_id).cloned().unwrap_or_default();
             children.sort_by_key(|id| {
                 nodes_by_id
                     .get(id)
@@ -1086,10 +1188,7 @@ fn print_tree_recursive(
     node_id: u64,
     prefix: &str,
 ) {
-    let mut children: Vec<u64> = children_by_id
-        .get(&node_id)
-        .cloned()
-        .unwrap_or_default();
+    let mut children: Vec<u64> = children_by_id.get(&node_id).cloned().unwrap_or_default();
 
     // Sort children by name
     children.sort_by_key(|id| {
@@ -1181,9 +1280,7 @@ async fn cmd_pull(server_override: Option<String>, subpath: Option<PathBuf>) -> 
         }
         processed.insert(node_id);
 
-        let idx = nodes_by_id
-            .get(&node_id)
-            .context("manifest missing node")?;
+        let idx = nodes_by_id.get(&node_id).context("manifest missing node")?;
         let node = &manifest.nodes[*idx];
         let path = node_to_path
             .get(&node_id)
@@ -1236,7 +1333,7 @@ async fn pull_file(
                 path.display()
             )
         })?;
-    let (wrapped_from_object, chunks) = nook_core::deserialize_encrypted_object(&cipher_bytes)?;
+    let (wrapped_from_object, chunks) = nook_vault::deserialize_encrypted_object(&cipher_bytes)?;
     // Prefer manifest's wrapped key but fall back if object envelope differs.
     let wrapped_to_use = if !wrapped_from_object.0.is_empty() {
         wrapped_from_object
@@ -1311,7 +1408,7 @@ fn now_unix() -> i64 {
 /// the request (SPEC-004 §4).
 fn signed_headers(auth: &ClientAuth, method: &str, path: &str, body: &[u8]) -> Result<HeaderMap> {
     let timestamp = now_unix();
-    let signature = nook_core::sign_request(&auth.vault_credential, method, path, timestamp, body);
+    let signature = nook_vault::sign_request(&auth.vault_credential, method, path, timestamp, body);
     let mut headers = HeaderMap::new();
     headers.insert(
         "X-Nook-Timestamp",
@@ -1324,8 +1421,13 @@ fn signed_headers(auth: &ClientAuth, method: &str, path: &str, body: &[u8]) -> R
     Ok(headers)
 }
 
-async fn head_object(client: &Client, server: &str, auth: &ClientAuth, object_id_hex: &str) -> Result<Option<String>> {
-    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+async fn head_object(
+    client: &Client,
+    server: &str,
+    auth: &ClientAuth,
+    object_id_hex: &str,
+) -> Result<Option<String>> {
+    let path = nook_vault::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
     let url = format!("{server}{path}");
     let headers = signed_headers(auth, "HEAD", &path, b"")?;
     let res = client.head(url).headers(headers).send().await?;
@@ -1351,7 +1453,7 @@ async fn put_object(
     bytes: Vec<u8>,
     etag: Option<&str>,
 ) -> Result<()> {
-    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+    let path = nook_vault::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
     let url = format!("{server}{path}");
     let mut headers = signed_headers(auth, "PUT", &path, &bytes)?;
     if let Some(tag) = etag {
@@ -1366,9 +1468,7 @@ async fn put_object(
         reqwest::StatusCode::PRECONDITION_FAILED => {
             Err(anyhow::anyhow!("CAS failure: head modified concurrently"))
         }
-        reqwest::StatusCode::INSUFFICIENT_STORAGE => {
-            Err(anyhow::anyhow!("vault quota exceeded"))
-        }
+        reqwest::StatusCode::INSUFFICIENT_STORAGE => Err(anyhow::anyhow!("vault quota exceeded")),
         reqwest::StatusCode::UNAUTHORIZED => {
             Err(anyhow::anyhow!("unauthorized: check vault ID/credential"))
         }
@@ -1376,8 +1476,13 @@ async fn put_object(
     }
 }
 
-async fn get_object(client: &Client, server: &str, auth: &ClientAuth, object_id_hex: &str) -> Result<Vec<u8>> {
-    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+async fn get_object(
+    client: &Client,
+    server: &str,
+    auth: &ClientAuth,
+    object_id_hex: &str,
+) -> Result<Vec<u8>> {
+    let path = nook_vault::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
     let url = format!("{server}{path}");
     let headers = signed_headers(auth, "GET", &path, b"")?;
     let res = client.get(url).headers(headers).send().await?;
@@ -1391,19 +1496,21 @@ async fn get_object(client: &Client, server: &str, auth: &ClientAuth, object_id_
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err(anyhow::anyhow!("unauthorized: check vault ID/credential"));
     }
-    Err(anyhow::anyhow!(
-        "GET failed with status {}",
-        res.status()
-    ))
+    Err(anyhow::anyhow!("GET failed with status {}", res.status()))
 }
 
-async fn fetch_manifest(client: &Client, server: &str, auth: &ClientAuth, vault_key: &VaultKey) -> Result<Manifest> {
+async fn fetch_manifest(
+    client: &Client,
+    server: &str,
+    auth: &ClientAuth,
+    vault_key: &VaultKey,
+) -> Result<Manifest> {
     let head_id = derive_head_object_id(vault_key);
     let head_hex = hex::encode(head_id);
     let manifest_bytes = get_object(client, server, auth, &head_hex)
         .await
         .context("manifest not found; push first")?;
-    let (wrapped, chunks) = nook_core::deserialize_encrypted_object(&manifest_bytes)?;
+    let (wrapped, chunks) = nook_vault::deserialize_encrypted_object(&manifest_bytes)?;
     let decrypted = decrypt_object(head_id, &wrapped, &chunks, vault_key)?;
     let manifest: Manifest = serde_json::from_slice(&decrypted.plaintext)?;
     manifest.validate_integrity()?;
@@ -1439,12 +1546,12 @@ fn resolve_subpath(
                 return Err(anyhow::anyhow!("subpath must not contain '..'"));
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(anyhow::anyhow!("subpath must be relative to the vault root"));
+                return Err(anyhow::anyhow!(
+                    "subpath must be relative to the vault root"
+                ));
             }
             Component::Normal(os) => {
-                let name = os
-                    .to_str()
-                    .context("subpath must be valid UTF-8")?;
+                let name = os.to_str().context("subpath must be valid UTF-8")?;
                 let mut found = None;
                 if let Some(children) = children_by_id.get(&current) {
                     for child_id in children {
@@ -1458,8 +1565,8 @@ fn resolve_subpath(
                         }
                     }
                 }
-                let child_id =
-                    found.ok_or_else(|| anyhow::anyhow!("subpath not found: {}", subpath.display()))?;
+                let child_id = found
+                    .ok_or_else(|| anyhow::anyhow!("subpath not found: {}", subpath.display()))?;
                 let idx = nodes_by_id
                     .get(&child_id)
                     .context("manifest missing child node")?;

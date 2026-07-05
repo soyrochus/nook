@@ -1,0 +1,66 @@
+[package]
+name = "nook-vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Amorphous end-to-end encrypted push/pull file vault with client and server binaries."
+readme = "../../README.md"
+keywords = ["encryption", "vault", "cli", "storage", "files"]
+categories = ["command-line-utilities", "cryptography", "filesystem"]
+exclude = [
+    "target/**",
+    ".github/**",
+]
+
+[lib]
+name = "nook_vault"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nook"
+path = "src/bin/nook.rs"
+
+[[bin]]
+name = "nookd"
+path = "src/bin/nookd.rs"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5.3"
+axum = { version = "0.7", features = ["macros"] }
+base64 = "0.22"
+bincode = "1"
+bytes = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+directories = "5"
+futures = "0.3"
+futures-util = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+keyring = { version = "4.1.3", features = ["apple-native-keyring-store"] }
+rand = "0.8"
+rand_core = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7.5.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "1.1.2"
+tower = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+walkdir = "2"
+zeroize = "1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

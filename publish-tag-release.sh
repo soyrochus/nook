@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 
 # Single source of truth for the version: [workspace.package] in Cargo.toml,
 # read via cargo itself rather than parsed by hand.
-version="$(cargo pkgid -p nook | sed 's/.*[@#]//')"
+version="$(cargo pkgid -p nook-vault | sed 's/.*[@#]//')"
 tag="v${version}"
 
 if ! git diff --quiet || ! git diff --cached --quiet; then

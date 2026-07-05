@@ -1,12 +1,12 @@
 # Build and run from the repository root, e.g.:
-#   podman build -f crates/nookd/Dockerfile -t nookd .
-#   docker build -f crates/nookd/Dockerfile -t nookd .
+#   podman build -f crates/nook-vault/Dockerfile -t nookd .
+#   docker build -f crates/nook-vault/Dockerfile -t nookd .
 
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p nookd
+RUN cargo build --release -p nook-vault --bin nookd
 
 FROM debian:bookworm-slim AS runtime
 # Fixed, predictable UID/GID (rather than an auto-assigned system UID) so

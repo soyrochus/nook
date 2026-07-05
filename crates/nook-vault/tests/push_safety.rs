@@ -26,13 +26,30 @@ fn stored_object_files(objects_dir: &std::path::Path) -> Vec<std::path::PathBuf>
         .collect()
 }
 
-fn init_and_set_root(config_home: &std::path::Path, server_url: &str, vault_id: &str, vault_credential: &str, vault_root: &std::path::Path) {
+fn init_and_set_root(
+    config_home: &std::path::Path,
+    server_url: &str,
+    vault_id: &str,
+    vault_credential: &str,
+    vault_root: &std::path::Path,
+) {
     let init = run_nook(
         config_home,
-        &["init", "--server", server_url, "--vault-id", vault_id, "--vault-credential", vault_credential],
+        &[
+            "init",
+            "--server",
+            server_url,
+            "--vault-id",
+            vault_id,
+            "--vault-credential",
+            vault_credential,
+        ],
     );
     assert!(init.status.success(), "init failed: {init:?}");
-    let root = run_nook(config_home, &["root", "--set", vault_root.to_str().unwrap()]);
+    let root = run_nook(
+        config_home,
+        &["root", "--set", vault_root.to_str().unwrap()],
+    );
     assert!(root.status.success(), "root --set failed: {root:?}");
 }
 
@@ -45,7 +62,13 @@ fn first_push_to_fresh_vault_succeeds() {
     let (vault_id, vault_credential) = create_vault(&storage_dir);
     let server = Nookd::start(&storage_dir);
     let server_url = server.url();
-    init_and_set_root(&config_home, &server_url, &vault_id, &vault_credential, &vault_root);
+    init_and_set_root(
+        &config_home,
+        &server_url,
+        &vault_id,
+        &vault_credential,
+        &vault_root,
+    );
 
     let push = run_nook(&config_home, &["push"]);
     assert!(
@@ -56,7 +79,10 @@ fn first_push_to_fresh_vault_succeeds() {
     // One object for the manifest (head) plus one for hello.txt's content.
     let objects_dir = storage_dir.join("objects");
     let count = stored_object_files(&objects_dir).len();
-    assert_eq!(count, 2, "expected the manifest object and one content object");
+    assert_eq!(
+        count, 2,
+        "expected the manifest object and one content object"
+    );
 }
 
 #[test]
@@ -68,13 +94,26 @@ fn corrupted_manifest_aborts_push_and_leaves_server_untouched() {
     let (vault_id, vault_credential) = create_vault(&storage_dir);
     let server = Nookd::start(&storage_dir);
     let server_url = server.url();
-    init_and_set_root(&config_home, &server_url, &vault_id, &vault_credential, &vault_root);
+    init_and_set_root(
+        &config_home,
+        &server_url,
+        &vault_id,
+        &vault_credential,
+        &vault_root,
+    );
 
-    assert!(run_nook(&config_home, &["push"]).status.success(), "initial push must succeed");
+    assert!(
+        run_nook(&config_home, &["push"]).status.success(),
+        "initial push must succeed"
+    );
 
     let objects_dir = storage_dir.join("objects");
     let entries = stored_object_files(&objects_dir);
-    assert_eq!(entries.len(), 2, "manifest + one content object after first push");
+    assert_eq!(
+        entries.len(),
+        2,
+        "manifest + one content object after first push"
+    );
 
     // Corrupt every stored object (flip a byte in the middle) so the
     // manifest is corrupted regardless of which file it turns out to be,

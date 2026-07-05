@@ -8,7 +8,8 @@ use support::run_nook;
 /// contacts the server during init, so these don't need to correspond to a
 /// real vault for these config-file-shape and passphrase tests.
 const FAKE_VAULT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FAKE_VAULT_CREDENTIAL: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const FAKE_VAULT_CREDENTIAL: &str =
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// `run_nook`'s support helper always sets `NOOK_PASSPHRASE`, and this
 /// sandboxed test environment has no OS keychain daemon available, so
@@ -58,7 +59,10 @@ fn init_produces_valid_toml_with_no_recoverable_key_material() {
 
     let parsed: toml::Value = toml::from_str(&contents).expect("config must be valid TOML");
     assert!(parsed.get("server").is_some());
-    assert_eq!(parsed.get("vault_id").and_then(|v| v.as_str()), Some(FAKE_VAULT_ID));
+    assert_eq!(
+        parsed.get("vault_id").and_then(|v| v.as_str()),
+        Some(FAKE_VAULT_ID)
+    );
 
     let secrets = parsed.get("secrets").expect("secrets table present");
     let mode = secrets.get("mode").and_then(|v| v.as_str());
@@ -120,7 +124,11 @@ fn non_toml_config_produces_a_clear_reinit_error() {
     let config_home = tmp.path().join("config");
     let nook_dir = config_home.join("nook");
     fs::create_dir_all(&nook_dir).unwrap();
-    fs::write(nook_dir.join("config.toml"), b"{ \"this\": \"is json, not toml\" }").unwrap();
+    fs::write(
+        nook_dir.join("config.toml"),
+        b"{ \"this\": \"is json, not toml\" }",
+    )
+    .unwrap();
 
     let out = run_nook(&config_home, &["status"]);
     assert!(!out.status.success());

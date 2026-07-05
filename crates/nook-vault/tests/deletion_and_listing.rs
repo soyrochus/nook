@@ -23,7 +23,10 @@ fn random_hex_id() -> String {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 struct Nookd {
@@ -105,9 +108,15 @@ impl SignedClient {
         }
     }
 
-    fn signed(&self, method: reqwest::Method, path: &str, body: &'static [u8]) -> reqwest::blocking::Response {
+    fn signed(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &'static [u8],
+    ) -> reqwest::blocking::Response {
         let timestamp = now_unix();
-        let sig = nook_core::sign_request(&self.credential, method.as_str(), path, timestamp, body);
+        let sig =
+            nook_vault::sign_request(&self.credential, method.as_str(), path, timestamp, body);
         self.client
             .request(method, format!("{}{}", self.base, path))
             .header("X-Nook-Timestamp", timestamp.to_string())
@@ -117,31 +126,40 @@ impl SignedClient {
             .unwrap()
     }
 
-    fn put(&self, namespace_id: &str, object_id: &str, body: &'static str) -> reqwest::blocking::Response {
-        let path = nook_core::object_path(&self.vault_id, namespace_id, object_id);
+    fn put(
+        &self,
+        namespace_id: &str,
+        object_id: &str,
+        body: &'static str,
+    ) -> reqwest::blocking::Response {
+        let path = nook_vault::object_path(&self.vault_id, namespace_id, object_id);
         self.signed(reqwest::Method::PUT, &path, body.as_bytes())
     }
 
     fn get(&self, namespace_id: &str, object_id: &str) -> reqwest::blocking::Response {
-        let path = nook_core::object_path(&self.vault_id, namespace_id, object_id);
+        let path = nook_vault::object_path(&self.vault_id, namespace_id, object_id);
         self.signed(reqwest::Method::GET, &path, b"")
     }
 
     fn delete(&self, namespace_id: &str, object_id: &str) -> reqwest::blocking::Response {
-        let path = nook_core::object_path(&self.vault_id, namespace_id, object_id);
+        let path = nook_vault::object_path(&self.vault_id, namespace_id, object_id);
         self.signed(reqwest::Method::DELETE, &path, b"")
     }
 
     fn list(&self, namespace_id: &str) -> reqwest::blocking::Response {
-        let path = nook_core::namespace_objects_path(&self.vault_id, namespace_id);
+        let path = nook_vault::namespace_objects_path(&self.vault_id, namespace_id);
         self.signed(reqwest::Method::GET, &path, b"")
     }
 }
 
 fn bytes_used(db_path: &PathBuf, vault_id: &str) -> i64 {
     let conn = Connection::open(db_path).unwrap();
-    conn.query_row("SELECT bytes_used FROM vaults WHERE vault_id = ?1", [vault_id], |row| row.get(0))
-        .unwrap()
+    conn.query_row(
+        "SELECT bytes_used FROM vaults WHERE vault_id = ?1",
+        [vault_id],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -161,7 +179,10 @@ fn delete_removes_object_and_frees_quota() {
     assert_eq!(res.status(), 204);
 
     assert_eq!(client.get(&ns, &obj).status(), 404);
-    assert_eq!(bytes_used(&db_path, &vault_id), used_before - "hello".len() as i64);
+    assert_eq!(
+        bytes_used(&db_path, &vault_id),
+        used_before - "hello".len() as i64
+    );
 }
 
 #[test]
@@ -194,7 +215,11 @@ fn unsigned_or_badly_signed_delete_is_rejected() {
 
     // Unsigned.
     let http = reqwest::blocking::Client::new();
-    let url = format!("http://{}{}", server.addr, nook_core::object_path(&vault_id, &ns, &obj));
+    let url = format!(
+        "http://{}{}",
+        server.addr,
+        nook_vault::object_path(&vault_id, &ns, &obj)
+    );
     assert_eq!(http.delete(&url).send().unwrap().status(), 401);
 
     // Wrong credential.
@@ -241,7 +266,10 @@ fn quota_full_vault_becomes_writable_after_delete() {
 
     assert_eq!(client.delete(&ns, &filler).status(), 204);
 
-    assert_eq!(client.put(&ns, &random_hex_id(), "1234567890").status(), 201);
+    assert_eq!(
+        client.put(&ns, &random_hex_id(), "1234567890").status(),
+        201
+    );
 }
 
 #[test]
@@ -273,7 +301,12 @@ fn listing_returns_namespace_objects_with_expected_fields() {
     }
     let sizes: std::collections::HashMap<&str, i64> = objects
         .iter()
-        .map(|e| (e["object_id"].as_str().unwrap(), e["size"].as_i64().unwrap()))
+        .map(|e| {
+            (
+                e["object_id"].as_str().unwrap(),
+                e["size"].as_i64().unwrap(),
+            )
+        })
         .collect();
     assert_eq!(sizes[obj_a.as_str()], 3);
     assert_eq!(sizes[obj_b.as_str()], 5);
@@ -301,7 +334,7 @@ fn unsigned_listing_is_rejected() {
     let url = format!(
         "http://{}{}",
         server.addr,
-        nook_core::namespace_objects_path(&vault_id, &random_hex_id())
+        nook_vault::namespace_objects_path(&vault_id, &random_hex_id())
     );
     assert_eq!(http.get(&url).send().unwrap().status(), 401);
 }
@@ -318,8 +351,18 @@ fn listing_does_not_leak_other_vaults_or_namespaces() {
     let mine = random_hex_id();
 
     assert_eq!(client_a.put(&ns, &mine, "mine").status(), 201);
-    assert_eq!(client_a.put(&random_hex_id(), &random_hex_id(), "other ns").status(), 201);
-    assert_eq!(client_b.put(&ns, &random_hex_id(), "other vault, same ns id").status(), 201);
+    assert_eq!(
+        client_a
+            .put(&random_hex_id(), &random_hex_id(), "other ns")
+            .status(),
+        201
+    );
+    assert_eq!(
+        client_b
+            .put(&ns, &random_hex_id(), "other vault, same ns id")
+            .status(),
+        201
+    );
 
     let body: serde_json::Value = client_a.list(&ns).json().unwrap();
     let objects = body["objects"].as_array().unwrap();

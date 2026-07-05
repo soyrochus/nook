@@ -6,10 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-/// `nookd` is a different workspace package, so Cargo does not set
-/// `CARGO_BIN_EXE_nookd` for `nook`'s integration tests (that mechanism only
-/// covers binaries of the current package). Locate (building if necessary)
-/// the sibling binary via the workspace target directory instead.
+/// Locate a package binary, building it if necessary.
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -26,11 +23,14 @@ pub fn ensure_built(bin_name: &str) -> PathBuf {
         }
     }
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", bin_name])
+        .args(["build", "-p", "nook-vault", "--bin", bin_name])
         .current_dir(&root)
         .status()
         .expect("failed to invoke cargo build");
-    assert!(status.success(), "cargo build -p {bin_name} failed");
+    assert!(
+        status.success(),
+        "cargo build -p nook-vault --bin {bin_name} failed"
+    );
     root.join("target/debug").join(bin_name)
 }
 
