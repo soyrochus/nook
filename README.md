@@ -220,6 +220,34 @@ Pull downloads and materializes files from the namespace into your local root:
 
 Both commands preserve directory structure and support selective sync.
 
+## Remove files / space reclamation
+
+Remove a file or an entire directory subtree from the namespace (local files
+under your root are never touched):
+
+```bash
+./target/release/nook rm docs/spec.md   # Remove a single file
+./target/release/nook rm docs/          # Remove a directory subtree
+```
+
+Garbage collection is automatic — there is no `gc` command. After every
+successful `push` or `rm`, the client deletes objects the updated manifest no
+longer references: content replaced by that push is reclaimed immediately,
+and historical orphans (e.g. residue of an interrupted push) are reclaimed
+once older than a grace window (default 24 hours, configurable via
+`gc_grace_seconds` in the client config or the `NOOK_GC_GRACE_SECONDS`
+environment variable). The grace window protects a concurrent pusher's
+uploaded-but-not-yet-linked objects from being swept mid-push; object ages
+are compared against server-issued timestamps only, so client clock skew
+cannot cause data loss. Freed space is subtracted from the vault's quota
+immediately. Deletion is final — Nook has no versioning or trash.
+
+Like everything else, cleanup is client-driven: the server cannot tell live
+objects from garbage (it only ever sees opaque IDs and ciphertext), so it
+never deletes anything on its own initiative. Against an older `nookd`
+without deletion support, `push`/`rm` still work and simply warn that space
+reclamation was skipped.
+
 ## Status / overrides
 
 Check whether the head object exists on the server:
@@ -265,6 +293,10 @@ All discovery happens locally by decrypting the manifest—no server queries rev
 ## Participation
 
 Contributions are welcome: issues, pull requests, critique, and discussion.
+
+For an overview of how the implementation fits together (crates, crypto,
+wire protocol, server/client internals, GC), see
+[`TECH-IMPLEMENTATION-GUIDE.md`](./TECH-IMPLEMENTATION-GUIDE.md).
 
 This project follows the [FOSS Pluralism Manifesto](./FOSS_PLURALISM_MANIFESTO.md), affirming respect for people, freedom to critique ideas, and space for diverse perspectives.
 

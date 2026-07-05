@@ -15,6 +15,12 @@ pub fn object_path(vault_id: &str, namespace_id: &str, object_id: &str) -> Strin
     format!("/v1/vault/{vault_id}/ns/{namespace_id}/obj/{object_id}")
 }
 
+/// The namespace-scoped object listing path (SPEC-005), used both to build
+/// request URLs and as the `PATH` component of the signed canonical string.
+pub fn namespace_objects_path(vault_id: &str, namespace_id: &str) -> String {
+    format!("/v1/vault/{vault_id}/ns/{namespace_id}/objects")
+}
+
 /// SHA-256 digest of a full, in-memory body. For streamed request bodies
 /// (server-side, where holding the whole body in memory to re-hash it would
 /// defeat the point of streaming), compute the digest incrementally instead

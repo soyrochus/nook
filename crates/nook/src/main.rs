@@ -32,6 +32,15 @@ const LOCAL_KEY_AAD: &[u8] = b"nook-local-vault-key-v1";
 /// scripted or CI use of the encrypted-local-file fallback.
 const PASSPHRASE_ENV_VAR: &str = "NOOK_PASSPHRASE";
 
+/// Environment override for the garbage-collection grace window (seconds),
+/// taking precedence over the config field.
+const GC_GRACE_ENV_VAR: &str = "NOOK_GC_GRACE_SECONDS";
+
+/// Default GC grace window: must exceed the longest plausible gap between a
+/// pusher's first object upload and its manifest swap, so a concurrent
+/// writer's not-yet-linked uploads are never swept (SPEC-005, design D4).
+const DEFAULT_GC_GRACE_SECONDS: u64 = 24 * 60 * 60;
+
 /// Bundle format tag for exported/imported namespace identities (SPEC-004 §6).
 const NAMESPACE_BUNDLE_PREFIX: &str = "nookns1";
 
@@ -85,6 +94,13 @@ enum Commands {
     Pull {
         subpath: Option<PathBuf>,
     },
+    /// Remove a file or directory subtree from the namespace (SPEC-005).
+    /// Operates on the remote manifest only; local files are never touched.
+    Rm {
+        /// Path inside the namespace to remove. Mandatory: emptying a whole
+        /// namespace requires naming its entries explicitly.
+        subpath: PathBuf,
+    },
     Status,
     /// Manage this client's namespace identity (SPEC-004 §6).
     Namespace {
@@ -111,6 +127,11 @@ struct Config {
     root: Option<PathBuf>,
     vault_id: String,
     namespace_id: String,
+    /// Grace window (seconds) for the automatic post-push sweep: unreferenced
+    /// objects younger than this survive, protecting a concurrent pusher's
+    /// uploaded-but-not-yet-linked objects (SPEC-005). Unset means the
+    /// default of 24 hours.
+    gc_grace_seconds: Option<u64>,
     secrets: KeyStorage,
 }
 
@@ -333,6 +354,7 @@ async fn main() -> Result<()> {
         Commands::Tree { subpath } => cmd_tree(cli.server, subpath).await?,
         Commands::Push { subpath } => cmd_push(cli.server, subpath).await?,
         Commands::Pull { subpath } => cmd_pull(cli.server, subpath).await?,
+        Commands::Rm { subpath } => cmd_rm(cli.server, subpath).await?,
         Commands::Status => cmd_status(cli.server).await?,
         Commands::Namespace { action } => match action {
             NamespaceCommand::Export => cmd_namespace_export().await?,
@@ -375,6 +397,7 @@ async fn cmd_init(
         root,
         vault_id,
         namespace_id,
+        gc_grace_seconds: None,
         secrets: key_storage,
     };
     save_config(&config)?;
@@ -498,6 +521,10 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
             ));
         }
     };
+    // Captured before any mutation: the CAS swap below proves this was the
+    // current manifest, so anything it referenced that the new manifest
+    // doesn't is safe to delete immediately (SPEC-005, sweep tier 1).
+    let previous_live = manifest_live_set(&manifest, &head_hex);
 
     // Build indexes for existing manifest
     let mut next_node_id = manifest.nodes.iter().map(|n| n.node_id).max().unwrap_or(0) + 1;
@@ -641,7 +668,192 @@ async fn cmd_push(server_override: Option<String>, subpath: Option<PathBuf>) -> 
     put_object(&client, &server, &auth, &head_hex, manifest_serialized, etag.as_deref()).await?;
 
     println!("Push complete.");
+
+    // Post-commit only: a failed CAS swap has already returned above, so a
+    // client that lost the race never deletes anything.
+    let new_live = manifest_live_set(&manifest, &head_hex);
+    sweep_namespace(&client, &server, &auth, &previous_live, &new_live, gc_grace_seconds(&cfg)).await;
     Ok(())
+}
+
+/// Removes a file or directory subtree from the remote manifest via the
+/// CAS-guarded manifest flow, then sweeps the newly unreferenced content
+/// objects. Local files under the root are never touched (SPEC-005).
+async fn cmd_rm(server_override: Option<String>, subpath: PathBuf) -> Result<()> {
+    let cfg = load_config().context("nook not initialized; run `nook init`")?;
+    let server = server_override.unwrap_or(cfg.server.clone());
+    let client = http_client()?;
+    let (vault_key, auth) = load_client_identity(&cfg)?;
+    let head_id = derive_head_object_id(&vault_key);
+    let head_hex = hex::encode(head_id);
+
+    let (mut manifest, etag) = match fetch_manifest_with_etag(&client, &server, &auth, &vault_key).await {
+        Ok((m, e)) => (m, e),
+        Err(ManifestFetchError::NotFound) => {
+            return Err(anyhow::anyhow!("namespace has no manifest yet; nothing to remove"));
+        }
+        Err(ManifestFetchError::Other(e)) => {
+            return Err(e.context(
+                "failed to fetch or decrypt the existing manifest; aborting rm without modifying server state",
+            ));
+        }
+    };
+    let previous_live = manifest_live_set(&manifest, &head_hex);
+
+    let (nodes_by_id, children_by_id) = index_manifest(&manifest);
+    let target_id = resolve_subpath(&manifest, &nodes_by_id, &children_by_id, &subpath)?;
+    if target_id == manifest.root_node_id {
+        return Err(anyhow::anyhow!(
+            "refusing to remove the namespace root; name the entries to remove explicitly"
+        ));
+    }
+    let subtree = collect_subtree(&manifest, &nodes_by_id, &children_by_id, target_id);
+    manifest.nodes.retain(|n| !subtree.contains(&n.node_id));
+
+    manifest.integrity_checksum = manifest.compute_integrity()?;
+    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    let manifest_object = encrypt_object(head_id, ObjectType::Manifest, &manifest_bytes, &vault_key)?;
+    let manifest_serialized = serialize_encrypted_object(&manifest_object)?;
+    put_object(&client, &server, &auth, &head_hex, manifest_serialized, etag.as_deref()).await?;
+
+    println!("Removed {}.", subpath.display());
+
+    let new_live = manifest_live_set(&manifest, &head_hex);
+    sweep_namespace(&client, &server, &auth, &previous_live, &new_live, gc_grace_seconds(&cfg)).await;
+    Ok(())
+}
+
+/// The set of object IDs a manifest keeps alive: the manifest head object
+/// itself (unconditionally, even for an empty manifest) plus every file
+/// node's content object.
+fn manifest_live_set(manifest: &Manifest, head_hex: &str) -> std::collections::HashSet<String> {
+    let mut live: std::collections::HashSet<String> = manifest
+        .nodes
+        .iter()
+        .filter_map(|n| n.content_object_id.map(hex::encode))
+        .collect();
+    live.insert(head_hex.to_string());
+    live
+}
+
+/// Effective GC grace window: env override, then config, then the default.
+fn gc_grace_seconds(cfg: &Config) -> u64 {
+    if let Ok(raw) = std::env::var(GC_GRACE_ENV_VAR) {
+        if let Ok(secs) = raw.parse::<u64>() {
+            return secs;
+        }
+        eprintln!("warning: ignoring unparsable {GC_GRACE_ENV_VAR}={raw}");
+    }
+    cfg.gc_grace_seconds.unwrap_or(DEFAULT_GC_GRACE_SECONDS)
+}
+
+/// Automatic garbage collection (SPEC-005): runs strictly after a successful
+/// manifest CAS swap and never fails the surrounding command — every error
+/// here degrades to a warning, and a later push re-sweeps whatever was
+/// missed.
+///
+/// Two tiers (design D3):
+/// 1. Objects referenced by the previous manifest but not the new one are
+///    deleted immediately — the CAS win proves no concurrent writer has
+///    linked them since.
+/// 2. Any other listed object outside the live set is deleted only once
+///    older than the grace window, so a concurrent pusher's
+///    uploaded-but-not-yet-linked objects survive until their own swap. Ages
+///    compare server-issued timestamps only; the client clock is never
+///    consulted.
+async fn sweep_namespace(
+    client: &Client,
+    server: &str,
+    auth: &ClientAuth,
+    previous_live: &std::collections::HashSet<String>,
+    new_live: &std::collections::HashSet<String>,
+    grace_seconds: u64,
+) {
+    let mut to_delete: Vec<String> = previous_live.difference(new_live).cloned().collect();
+    let dereferenced: std::collections::HashSet<String> = to_delete.iter().cloned().collect();
+
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    match list_namespace_objects(client, server, auth).await {
+        Ok(listing) => {
+            for obj in listing.objects {
+                sizes.insert(obj.object_id.clone(), obj.size);
+                if new_live.contains(&obj.object_id) || dereferenced.contains(&obj.object_id) {
+                    continue;
+                }
+                if listing.server_time.saturating_sub(obj.updated_at) > grace_seconds as i64 {
+                    to_delete.push(obj.object_id);
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: could not list namespace objects for cleanup ({err:#}); \
+                 sweeping only objects dereferenced by this operation"
+            );
+        }
+    }
+
+    let mut deleted = 0usize;
+    let mut freed: u64 = 0;
+    let mut failures = 0usize;
+    for object_id in &to_delete {
+        match delete_object(client, server, auth, object_id).await {
+            Ok(()) => {
+                deleted += 1;
+                freed += sizes.get(object_id).copied().unwrap_or(0);
+            }
+            Err(_) => failures += 1,
+        }
+    }
+    if deleted > 0 {
+        println!("Reclaimed {deleted} unreferenced object(s) ({freed} bytes).");
+    }
+    if failures > 0 {
+        eprintln!("warning: {failures} object deletion(s) failed; a later push will reclaim them");
+    }
+}
+
+/// One entry of the namespace listing: the only attributes the server knows.
+#[derive(Debug, Deserialize)]
+struct ListedObject {
+    object_id: String,
+    size: u64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamespaceListing {
+    /// Server-side "now", so object ages can be computed without trusting
+    /// the client clock.
+    server_time: i64,
+    objects: Vec<ListedObject>,
+}
+
+async fn list_namespace_objects(client: &Client, server: &str, auth: &ClientAuth) -> Result<NamespaceListing> {
+    let path = nook_core::namespace_objects_path(&auth.vault_id, &auth.namespace_id);
+    let url = format!("{server}{path}");
+    let headers = signed_headers(auth, "GET", &path, b"")?;
+    let res = client.get(url).headers(headers).send().await?;
+    if !res.status().is_success() {
+        return Err(anyhow::anyhow!("listing failed with status {}", res.status()));
+    }
+    res.json::<NamespaceListing>().await.context("parsing namespace listing")
+}
+
+/// Deletes one object. A 404 counts as success (another client already swept
+/// it); a 405 means the server predates SPEC-005 deletion support.
+async fn delete_object(client: &Client, server: &str, auth: &ClientAuth, object_id_hex: &str) -> Result<()> {
+    let path = nook_core::object_path(&auth.vault_id, &auth.namespace_id, object_id_hex);
+    let url = format!("{server}{path}");
+    let headers = signed_headers(auth, "DELETE", &path, b"")?;
+    let res = client.delete(url).headers(headers).send().await?;
+    match res.status() {
+        reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND => Ok(()),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+            Err(anyhow::anyhow!("server does not support object deletion"))
+        }
+        other => Err(anyhow::anyhow!("DELETE failed with status {other}")),
+    }
 }
 
 /// Builds mappings from filesystem paths to manifest node IDs and vice versa
@@ -1016,7 +1228,14 @@ async fn pull_file(
         .context("file entry missing object id")?;
     let wrapped_dek = node.wrapped_dek.clone().context("missing wrapped dek")?;
     let wrapped = WrappedKey(wrapped_dek);
-    let cipher_bytes = get_object(client, server, auth, &hex::encode(object_id)).await?;
+    let cipher_bytes = get_object(client, server, auth, &hex::encode(object_id))
+        .await
+        .with_context(|| {
+            format!(
+                "fetching content for {} — if a concurrent writer replaced or removed it, re-run `nook pull`",
+                path.display()
+            )
+        })?;
     let (wrapped_from_object, chunks) = nook_core::deserialize_encrypted_object(&cipher_bytes)?;
     // Prefer manifest's wrapped key but fall back if object envelope differs.
     let wrapped_to_use = if !wrapped_from_object.0.is_empty() {

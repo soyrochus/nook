@@ -61,7 +61,16 @@ directory structure, or paths. All meaning exists exclusively on the client.
   can't decrypt data for namespaces whose key they don't have. Vault
   credential compromise means storage-level forgery (read/write/delete
   ciphertext, exhaust quota) across every namespace in that vault, not
-  decryption of any of them.
+  decryption of any of them. Since SPEC-005 added the `DELETE` verb and the
+  namespace object-listing endpoint (both HMAC-authenticated like every
+  other request), a credential holder can also *enumerate* a namespace's
+  object IDs, sizes, and last-write timestamps and *destroy* its ciphertext
+  outright. This discloses nothing the server operator couldn't already see
+  on disk, and destruction was already possible by overwriting objects with
+  garbage — but it makes the "credential = full storage grant" trade-off
+  concrete: a leaked credential now permits convenient, targeted deletion of
+  every namespace in the vault. Encryption never protects *availability*;
+  keep independent backups of anything you cannot afford to lose.
 * **`nookd`'s vault-credential store is a genuine secret store, not
   leak-safe ciphertext.** Unlike the rest of `nookd`'s storage, the `vaults`
   table holds credentials in raw (not hashed) form, because HMAC

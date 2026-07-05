@@ -149,7 +149,11 @@ async fn run_server(listen: String, storage: PathBuf, default_quota_bytes: Optio
     let app = Router::new()
         .route(
             "/v1/vault/:vault_id/ns/:namespace_id/obj/:object_id",
-            get(handle_get).put(handle_put).head(handle_head),
+            get(handle_get).put(handle_put).head(handle_head).delete(handle_delete),
+        )
+        .route(
+            "/v1/vault/:vault_id/ns/:namespace_id/objects",
+            get(handle_list),
         )
         .with_state(state);
 
@@ -429,6 +433,142 @@ async fn handle_put(
         PutOutcome::CasConflict => StatusCode::PRECONDITION_FAILED.into_response(),
         PutOutcome::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE.into_response(),
     }
+}
+
+/// Client-driven deletion (SPEC-005): the server never decides on its own
+/// what is garbage — it only executes deletes issued by a credential holder.
+async fn handle_delete(
+    State(state): State<AppState>,
+    Path((vault_id, namespace_id, object_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !valid_path_ids(&vault_id, &namespace_id, &object_id) {
+        return (StatusCode::BAD_REQUEST, "invalid id").into_response();
+    }
+    let path = nook_core::object_path(&vault_id, &namespace_id, &object_id);
+    if let Some(resp) = authenticate(&state, "DELETE", &path, &headers, &[]).await {
+        return resp;
+    }
+
+    let object_path = state.objects_dir.join(&vault_id).join(&namespace_id).join(&object_id);
+    let outcome = task::spawn_blocking({
+        let db_path = state.db_path.clone();
+        move || commit_delete(&db_path, &vault_id, &namespace_id, &object_id)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(true)) => {
+            // Metadata (row + quota) is already committed; a failure here only
+            // leaves an orphan file with no DB record, the same self-healing
+            // crash-window class as PUT's rename/store_meta gap (SPEC-003).
+            if let Err(err) = fs::remove_file(&object_path).await {
+                error!("object file removal failed after metadata delete: {err:?}");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(err)) => {
+            error!("commit_delete failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(err) => {
+            error!("commit_delete task panicked: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Deletes the object's metadata row and releases its quota in one
+/// transaction. Returns `false` (no metadata touched) if the row is absent.
+fn commit_delete(db_path: &FsPath, vault_id: &str, namespace_id: &str, object_id: &str) -> Result<bool> {
+    let mut conn = Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+
+    let size: Option<i64> = tx
+        .query_row(
+            "SELECT size FROM objects WHERE vault_id = ?1 AND namespace_id = ?2 AND object_id = ?3",
+            (vault_id, namespace_id, object_id),
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(size) = size else {
+        return Ok(false);
+    };
+
+    tx.execute(
+        "DELETE FROM objects WHERE vault_id = ?1 AND namespace_id = ?2 AND object_id = ?3",
+        (vault_id, namespace_id, object_id),
+    )?;
+    tx.execute(
+        "UPDATE vaults SET bytes_used = bytes_used - ?1 WHERE vault_id = ?2",
+        (size, vault_id),
+    )?;
+
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Namespace object listing (SPEC-005): discloses only what the server
+/// already knows — opaque IDs, sizes, and its own timestamps. `server_time`
+/// is included so clients can compute object ages without ever consulting
+/// their own clock.
+async fn handle_list(
+    State(state): State<AppState>,
+    Path((vault_id, namespace_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !nook_core::is_valid_hex_id(&vault_id) || !nook_core::is_valid_hex_id(&namespace_id) {
+        return (StatusCode::BAD_REQUEST, "invalid id").into_response();
+    }
+    let path = nook_core::namespace_objects_path(&vault_id, &namespace_id);
+    if let Some(resp) = authenticate(&state, "GET", &path, &headers, &[]).await {
+        return resp;
+    }
+
+    let rows = task::spawn_blocking({
+        let db_path = state.db_path.clone();
+        move || -> Result<Vec<(String, i64, i64)>> {
+            let conn = Connection::open(db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT object_id, size, updated_at FROM objects WHERE vault_id = ?1 AND namespace_id = ?2",
+            )?;
+            let rows = stmt
+                .query_map((&vault_id, &namespace_id), |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    })
+    .await;
+
+    let rows = match rows {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            error!("listing query failed: {err:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(err) => {
+            error!("listing task panicked: {err:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let body = serde_json::json!({
+        "server_time": now_unix(),
+        "objects": rows
+            .into_iter()
+            .map(|(object_id, size, updated_at)| {
+                serde_json::json!({ "object_id": object_id, "size": size, "updated_at": updated_at })
+            })
+            .collect::<Vec<_>>(),
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
 }
 
 fn valid_path_ids(vault_id: &str, namespace_id: &str, object_id: &str) -> bool {

@@ -116,11 +116,19 @@ pub fn create_vault(storage: &Path) -> (String, String) {
 /// fixed passphrase, so tests never touch the real user config or block on
 /// an interactive prompt regardless of whether an OS keychain is present.
 pub fn run_nook(config_home: &Path, args: &[&str]) -> Output {
+    run_nook_env(config_home, &[], args)
+}
+
+/// Like [`run_nook`], with extra environment variables (e.g.
+/// `NOOK_GC_GRACE_SECONDS` for sweep tests).
+pub fn run_nook_env(config_home: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> Output {
     let bin = ensure_built("nook");
-    Command::new(bin)
-        .args(args)
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .env("XDG_CONFIG_HOME", config_home)
-        .env("NOOK_PASSPHRASE", "test-passphrase-not-for-real-use")
-        .output()
-        .expect("failed to run nook")
+        .env("NOOK_PASSPHRASE", "test-passphrase-not-for-real-use");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("failed to run nook")
 }
